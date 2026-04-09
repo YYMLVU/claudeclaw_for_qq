@@ -13,7 +13,7 @@
  *   - Slash commands / interactions
  */
 
-import { streamUserMessage } from "../runner";
+import { streamUserMessage, parseTaskOverride } from "../runner";
 import { getSettings, loadSettings } from "../config";
 
 // --- QQ Official API constants ---
@@ -370,9 +370,13 @@ async function handleC2CMessage(msg: C2CMessage): Promise<void> {
   const imageUrl = msg.attachments?.[0]?.url;
   console.log(`[${new Date().toLocaleTimeString()}] QQ C2C ${label}: "${content.slice(0, 60)}"`);
 
+  // Parse /task <model> override from raw content before buildPrompt wraps it
+  const { model: taskModel, cleanPrompt: taskCleanContent } = parseTaskOverride(content);
+  const effectiveContent = taskModel ? taskCleanContent : content;
+
   try {
     await sendTyping(msg.author.user_openid, "user");
-    const prompt = buildPrompt(label, content, imageUrl);
+    const prompt = buildPrompt(label, effectiveContent, imageUrl);
 
     let placeholderId: string | null = null;
     let accumulated = "";
@@ -409,7 +413,7 @@ async function handleC2CMessage(msg: C2CMessage): Promise<void> {
 
     const onUnblock = () => {};
 
-    const exitCode = await streamUserMessage("qq", prompt, onChunk, onUnblock);
+    const exitCode = await streamUserMessage("qq", prompt, onChunk, onUnblock, undefined, undefined, taskModel ?? undefined);
 
     // Flush any remaining debounced edit
     if (editDebounce) { clearTimeout(editDebounce); editDebounce = null; }
@@ -480,9 +484,13 @@ async function handleGroupMessage(msg: GroupMessage): Promise<void> {
   const imageUrl = msg.attachments?.[0]?.url;
   console.log(`[${new Date().toLocaleTimeString()}] QQ Group ${groupLabel} ${label}: "${content.slice(0, 60)}"`);
 
+  // Parse /task <model> override from raw content before buildPrompt wraps it
+  const { model: groupTaskModel, cleanPrompt: groupCleanContent } = parseTaskOverride(content);
+  const groupEffectiveContent = groupTaskModel ? groupCleanContent : content;
+
   try {
     await sendTyping(msg.group_openid, "group");
-    const prompt = buildPrompt(`${label} in ${groupLabel}`, content, imageUrl);
+    const prompt = buildPrompt(`${label} in ${groupLabel}`, groupEffectiveContent, imageUrl);
 
     let placeholderId: string | null = null;
     let accumulated = "";
@@ -518,7 +526,7 @@ async function handleGroupMessage(msg: GroupMessage): Promise<void> {
     };
 
     const onUnblock = () => {};
-    const exitCode = await streamUserMessage("qq", prompt, onChunk, onUnblock);
+    const exitCode = await streamUserMessage("qq", prompt, onChunk, onUnblock, undefined, undefined, groupTaskModel ?? undefined);
 
     if (editDebounce) { clearTimeout(editDebounce); editDebounce = null; }
 
@@ -583,9 +591,13 @@ async function handleGuildMessage(msg: GuildMessage): Promise<void> {
   const imageUrl = msg.attachments?.[0]?.url;
   console.log(`[${new Date().toLocaleTimeString()}] QQ Guild ch=${msg.channel_id} ${label}: "${content.slice(0, 60)}"`);
 
+  // Parse /task <model> override from raw content before buildPrompt wraps it
+  const { model: guildTaskModel, cleanPrompt: guildCleanContent } = parseTaskOverride(content);
+  const guildEffectiveContent = guildTaskModel ? guildCleanContent : content;
+
   try {
     await sendTyping(msg.channel_id, "channel");
-    const prompt = buildPrompt(`${label} in guild:${msg.guild_id}`, content, imageUrl);
+    const prompt = buildPrompt(`${label} in guild:${msg.guild_id}`, guildEffectiveContent, imageUrl);
 
     let placeholderId: string | null = null;
     let accumulated = "";
@@ -621,7 +633,7 @@ async function handleGuildMessage(msg: GuildMessage): Promise<void> {
     };
 
     const onUnblock = () => {};
-    const exitCode = await streamUserMessage("qq", prompt, onChunk, onUnblock);
+    const exitCode = await streamUserMessage("qq", prompt, onChunk, onUnblock, undefined, undefined, guildTaskModel ?? undefined);
 
     if (editDebounce) { clearTimeout(editDebounce); editDebounce = null; }
 

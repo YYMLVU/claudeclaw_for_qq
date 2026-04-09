@@ -71,7 +71,7 @@ const TASK_MODELS = new Set(["opus", "sonnet", "haiku"]);
  *   /task sonnet explain the code   → model="sonnet", prompt="explain the code"
  *   /task haiku summarize this      → model="haiku", prompt="summarize this"
  */
-function parseTaskOverride(prompt: string): { model: string | null; cleanPrompt: string } {
+export function parseTaskOverride(prompt: string): { model: string | null; cleanPrompt: string } {
   const match = prompt.match(/^\/task\s+(\S+)\s*/i);
   if (!match) return { model: null, cleanPrompt: prompt };
   const candidate = match[1].toLowerCase();
@@ -790,9 +790,10 @@ export async function streamUserMessage(
   onUnblock: () => void,
   threadId?: string,
   idleTimeoutMs?: number,
+  overrideModel?: string,
 ): Promise<number> {
   return enqueue(
-    () => streamClaude(name, prefixUserMessageWithClock(prompt), onChunk, onUnblock, threadId, idleTimeoutMs),
+    () => streamClaude(name, prefixUserMessageWithClock(prompt), onChunk, onUnblock, threadId, idleTimeoutMs, overrideModel),
     threadId,
   ) as unknown as Promise<number>;
 }
