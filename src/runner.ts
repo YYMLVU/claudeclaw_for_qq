@@ -59,6 +59,27 @@ export interface RunResult {
 
 const RATE_LIMIT_PATTERN = /you.ve hit your limit|out of extra usage/i;
 
+const TASK_MODELS = new Set(["opus", "sonnet", "haiku"]);
+
+/**
+ * Parse `/task <model>` prefix from a prompt.
+ * Only opus, sonnet, haiku are accepted.
+ * Returns the extracted model name (or null) and the cleaned prompt.
+ *
+ * Supported formats:
+ *   /task opus fix this bug         → model="opus", prompt="fix this bug"
+ *   /task sonnet explain the code   → model="sonnet", prompt="explain the code"
+ *   /task haiku summarize this      → model="haiku", prompt="summarize this"
+ */
+function parseTaskOverride(prompt: string): { model: string | null; cleanPrompt: string } {
+  const match = prompt.match(/^\/task\s+(\S+)\s*/i);
+  if (!match) return { model: null, cleanPrompt: prompt };
+  const candidate = match[1].toLowerCase();
+  if (!TASK_MODELS.has(candidate)) return { model: null, cleanPrompt: prompt };
+  const cleanPrompt = prompt.slice(match[0].length).trim();
+  return { model: candidate, cleanPrompt };
+}
+
 // Serial queue — prevents concurrent --resume on the same session
 // Global queue for non-thread messages (backward compatible)
 let globalQueue: Promise<unknown> = Promise.resolve();
@@ -386,6 +407,10 @@ async function execClaude(name: string, prompt: string, threadId?: string): Prom
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
   const logFile = join(LOGS_DIR, `${name}-${timestamp}.log`);
 
+  // Parse /task <model> override — strips the prefix from prompt
+  const { model: taskModel, cleanPrompt } = parseTaskOverride(prompt);
+  const effectivePrompt = taskModel ? cleanPrompt : prompt;
+
   const settings = getSettings();
   const { security, model, api, fallback, agentic } = settings;
 
@@ -394,8 +419,16 @@ async function execClaude(name: string, prompt: string, threadId?: string): Prom
   let taskType = "unknown";
   let routingReasoning = "";
 
-  if (agentic.enabled) {
-    const routing = selectModel(prompt, agentic.modes, agentic.defaultMode);
+  if (taskModel) {
+    // /task override takes highest priority
+    primaryConfig = { model: taskModel, api };
+    taskType = "task-override";
+    routingReasoning = `/task ${taskModel} override`;
+    console.log(
+      `[${new Date().toLocaleTimeString()}] Task model override: ${taskModel} (prompt stripped /task prefix)`
+    );
+  } else if (agentic.enabled) {
+    const routing = selectModel(effectivePrompt, agentic.modes, agentic.defaultMode);
     primaryConfig = { model: routing.model, api };
     taskType = routing.taskType;
     routingReasoning = routing.reasoning;
@@ -420,7 +453,7 @@ async function execClaude(name: string, prompt: string, threadId?: string): Prom
   // New session: use json output to capture Claude's session_id
   // Resumed session: use text output with --resume
   const outputFormat = isNew ? "json" : "text";
-  const args = ["claude", "-p", prompt, "--output-format", outputFormat, ...securityArgs];
+  const args = ["claude", "-p", effectivePrompt, "--output-format", outputFormat, ...securityArgs];
 
   if (!isNew) {
     args.push("--resume", existing.sessionId);
@@ -507,8 +540,8 @@ async function execClaude(name: string, prompt: string, threadId?: string): Prom
     `Date: ${new Date().toISOString()}`,
     `Session: ${sessionId} (${isNew ? "new" : "resumed"})`,
     `Model config: ${usedFallback ? "fallback" : "primary"}`,
-    ...(agentic.enabled ? [`Task type: ${taskType}`, `Routing: ${routingReasoning}`] : []),
-    `Prompt: ${prompt}`,
+    ...(agentic.enabled || taskModel ? [`Task type: ${taskType}`, `Routing: ${routingReasoning}`] : []),
+    `Prompt: ${effectivePrompt}`,
     `Exit code: ${result.exitCode}`,
     "",
     "## Output",
@@ -585,8 +618,14 @@ async function streamClaude(
   onUnblock: () => void,
   threadId?: string,
   idleTimeoutMs?: number,
+  overrideModel?: string,
 ): Promise<number> {
   await mkdir(LOGS_DIR, { recursive: true });
+
+  // Parse /task <model> override — strips the prefix from prompt
+  const { model: taskModel, cleanPrompt } = parseTaskOverride(prompt);
+  const effectivePrompt = taskModel ? cleanPrompt : prompt;
+  const effectiveModel = taskModel || overrideModel;
 
   const existing = threadId
     ? await getThreadSession(threadId)
@@ -594,10 +633,16 @@ async function streamClaude(
   const { security, model, api } = getSettings();
   const securityArgs = buildSecurityArgs(security);
 
+  if (taskModel) {
+    console.log(
+      `[${new Date().toLocaleTimeString()}] Task model override: ${taskModel} (prompt stripped /task prefix)`
+    );
+  }
+
   // stream-json gives us events as they happen — text before tool calls,
   // so we can unblock the UI as soon as Claude acknowledges, not after sub-agents finish.
   // --verbose is required for stream-json to produce output in -p (print) mode.
-  const args = ["claude", "-p", prompt, "--output-format", "stream-json", "--verbose", ...securityArgs];
+  const args = ["claude", "-p", effectivePrompt, "--output-format", "stream-json", "--verbose", ...securityArgs];
 
   if (existing) args.push("--resume", existing.sessionId);
 
@@ -617,11 +662,11 @@ async function streamClaude(
     args.push("--append-system-prompt", appendParts.join("\n\n"));
   }
 
-  const normalizedModel = model.trim().toLowerCase();
-  if (model.trim() && normalizedModel !== "glm") args.push("--model", model.trim());
+  const normalizedModel = (effectiveModel || model).trim().toLowerCase();
+  if ((effectiveModel || model).trim() && normalizedModel !== "glm") args.push("--model", (effectiveModel || model).trim());
 
   const { CLAUDECODE: _, ...cleanEnv } = process.env;
-  const childEnv = buildChildEnv(cleanEnv as Record<string, string>, model, api);
+  const childEnv = buildChildEnv(cleanEnv as Record<string, string>, effectiveModel || model, api);
 
   console.log(`[${new Date().toLocaleTimeString()}] Running: ${name} (stream-json, session: ${existing?.sessionId?.slice(0, 8) ?? "new"})`);
 

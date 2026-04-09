@@ -186,6 +186,19 @@ Enable automatic model selection based on message content:
 }
 ```
 
+### Task Model Override
+
+Use `/task <model>` to temporarily override the model for a single message. The override is only applied to that specific request — the next message automatically reverts to the default or agentic routing.
+
+**Supported models**: `opus`, `sonnet`, `haiku`
+
+**Usage**:
+- `/task opus Explain this complex architecture` — Use Opus for this request only
+- `/task sonnet Fix this bug in the code` — Use Sonnet for this request only
+- `/task haiku Summarize this` — Use Haiku for a quick summary
+
+**Priority**: `/task` override takes highest priority, above agentic routing and global config.
+
 ### Cron Jobs
 
 Create jobs in `.claude/claudeclaw/jobs/*.md`:
