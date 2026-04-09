@@ -644,7 +644,8 @@ async function streamClaude(
   // --verbose is required for stream-json to produce output in -p (print) mode.
   const args = ["claude", "-p", effectivePrompt, "--output-format", "stream-json", "--verbose", ...securityArgs];
 
-  if (existing) args.push("--resume", existing.sessionId);
+  // Only resume existing session when NOT overriding model — --resume locks the session's original model
+  if (existing && !effectiveModel) args.push("--resume", existing.sessionId);
 
   const promptContent = await loadPrompts();
   const appendParts: string[] = ["You are running inside ClaudeClaw."];
