@@ -13,7 +13,7 @@
  *   - Slash commands / interactions
  */
 
-import { runUserMessage } from "../runner";
+import { streamUserMessage } from "../runner";
 import { getSettings, loadSettings } from "../config";
 
 // --- QQ Official API constants ---
@@ -223,6 +223,22 @@ async function sendTyping(channelId: string, endpoint: "user" | "group" | "chann
   }
 }
 
+// --- Message edit API (PATCH /v2/{users|groups|channels}/{id}/messages/{msg_id}) ---
+
+async function editMessage(
+  endpoint: "user" | "group" | "channel",
+  channelId: string,
+  msgId: string,
+  content: string,
+): Promise<void> {
+  const url = endpoint === "user"
+    ? `/v2/users/${channelId}/messages/${msgId}`
+    : endpoint === "group"
+      ? `/v2/groups/${channelId}/messages/${msgId}`
+      : `/v2/channels/${channelId}/messages/${msgId}`;
+  await qqApi(url, "PATCH", { content });
+}
+
 // --- WebSocket helpers ---
 
 function sendWs(payload: unknown): void {
@@ -357,24 +373,80 @@ async function handleC2CMessage(msg: C2CMessage): Promise<void> {
   try {
     await sendTyping(msg.author.user_openid, "user");
     const prompt = buildPrompt(label, content, imageUrl);
-    const result = await runUserMessage("qq", prompt);
 
-    if (result.exitCode !== 0) {
-      await sendC2CMessage(msg.author.user_openid, `Error (exit ${result.exitCode}): ${result.stderr || result.stdout || "Unknown error"}`);
-    } else {
-      // QQ has a 2000 char limit for text messages; split if needed
-      const text = (result.stdout || "").trim();
-      if (!text) {
-        await sendC2CMessage(msg.author.user_openid, "(empty response)");
-      } else if (text.length <= 2000) {
-        await sendC2CMessage(msg.author.user_openid, text, msg.id);
+    let placeholderId: string | null = null;
+    let accumulated = "";
+    let editDebounce: ReturnType<typeof setTimeout> | null = null;
+
+    const onChunk = async (text: string) => {
+      accumulated += text;
+      if (!placeholderId && accumulated.trim()) {
+        try {
+          const token = await refreshAccessToken(config.appId, config.clientSecret);
+          const res = await fetch(`${QQ_API_BASE}/v2/users/${msg.author.user_openid}/messages`, {
+            method: "POST",
+            headers: {
+              Authorization: `QQBot ${token}`,
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({ content: accumulated.trimEnd().slice(0, 2000), msg_type: 0, msg_id: msg.id }),
+          });
+          const data = (await res.json()) as { id?: string; msg_id?: string };
+          placeholderId = data.id ?? data.msg_id ?? null;
+        } catch {
+          placeholderId = null;
+        }
+        return;
+      }
+      if (editDebounce) clearTimeout(editDebounce);
+      editDebounce = setTimeout(async () => {
+        if (placeholderId) {
+          try { await editMessage("user", msg.author.user_openid, placeholderId, accumulated.trimEnd().slice(0, 2000)); } catch { placeholderId = null; }
+        }
+        editDebounce = null;
+      }, 1500);
+    };
+
+    const onUnblock = () => {};
+
+    const exitCode = await streamUserMessage("qq", prompt, onChunk, onUnblock);
+
+    // Flush any remaining debounced edit
+    if (editDebounce) { clearTimeout(editDebounce); editDebounce = null; }
+
+    // If placeholder was set, do final edit. Otherwise send the full text.
+    const fullText = accumulated.trim();
+    if (exitCode !== 0) {
+      if (placeholderId) {
+        try { await editMessage("user", msg.author.user_openid, placeholderId, `Error (exit ${exitCode}): Claude session error`); } catch {}
       } else {
-        // Split into chunks
-        const chunks = splitMessage(text, 2000);
-        for (let i = 0; i < chunks.length; i++) {
-          await sendC2CMessage(msg.author.user_openid, chunks[i], i === 0 ? msg.id : undefined);
+        await sendC2CMessage(msg.author.user_openid, `Error (exit ${exitCode}): Claude session error`);
+      }
+    } else if (fullText) {
+      if (placeholderId) {
+        const displayText = fullText.slice(0, 2000);
+        try { await editMessage("user", msg.author.user_openid, placeholderId, displayText); } catch {}
+        // Send overflow as new messages
+        if (fullText.length > 2000) {
+          const remaining = fullText.slice(2000);
+          const chunks = splitMessage(remaining, 2000);
+          for (const chunk of chunks) {
+            await sendC2CMessage(msg.author.user_openid, chunk);
+          }
+        }
+      } else {
+        // Fallback: no placeholder was created, send as split messages
+        if (fullText.length <= 2000) {
+          await sendC2CMessage(msg.author.user_openid, fullText, msg.id);
+        } else {
+          const chunks = splitMessage(fullText, 2000);
+          for (let i = 0; i < chunks.length; i++) {
+            await sendC2CMessage(msg.author.user_openid, chunks[i], i === 0 ? msg.id : undefined);
+          }
         }
       }
+    } else if (!placeholderId) {
+      await sendC2CMessage(msg.author.user_openid, "(empty response)");
     }
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err);
@@ -398,7 +470,7 @@ async function handleGroupMessage(msg: GroupMessage): Promise<void> {
 
   const shouldRespond = isGroupMentioned(msg) || isGroupListen(msg.group_openid, config);
   if (!shouldRespond) {
-    debugLog(`Skip group msg (no mention/listen): ${content}`);
+    debugLog(`Skip group msg (no mention/listen)`);
     return;
   }
 
@@ -411,22 +483,74 @@ async function handleGroupMessage(msg: GroupMessage): Promise<void> {
   try {
     await sendTyping(msg.group_openid, "group");
     const prompt = buildPrompt(`${label} in ${groupLabel}`, content, imageUrl);
-    const result = await runUserMessage("qq", prompt);
 
-    if (result.exitCode !== 0) {
-      await sendGroupMessage(msg.group_openid, `Error (exit ${result.exitCode}): ${result.stderr || result.stdout || "Unknown error"}`);
-    } else {
-      const text = (result.stdout || "").trim();
-      if (!text) {
-        await sendGroupMessage(msg.group_openid, "(empty response)");
-      } else if (text.length <= 2000) {
-        await sendGroupMessage(msg.group_openid, text, msg.id);
+    let placeholderId: string | null = null;
+    let accumulated = "";
+    let editDebounce: ReturnType<typeof setTimeout> | null = null;
+
+    const onChunk = async (text: string) => {
+      accumulated += text;
+      if (!placeholderId && accumulated.trim()) {
+        try {
+          const token = await refreshAccessToken(config.appId, config.clientSecret);
+          const res = await fetch(`${QQ_API_BASE}/v2/groups/${msg.group_openid}/messages`, {
+            method: "POST",
+            headers: {
+              Authorization: `QQBot ${token}`,
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({ content: accumulated.trimEnd().slice(0, 2000), msg_type: 0, msg_id: msg.id }),
+          });
+          const data = (await res.json()) as { id?: string; msg_id?: string };
+          placeholderId = data.id ?? data.msg_id ?? null;
+        } catch {
+          placeholderId = null;
+        }
+        return;
+      }
+      if (editDebounce) clearTimeout(editDebounce);
+      editDebounce = setTimeout(async () => {
+        if (placeholderId) {
+          try { await editMessage("group", msg.group_openid, placeholderId, accumulated.trimEnd().slice(0, 2000)); } catch { placeholderId = null; }
+        }
+        editDebounce = null;
+      }, 1500);
+    };
+
+    const onUnblock = () => {};
+    const exitCode = await streamUserMessage("qq", prompt, onChunk, onUnblock);
+
+    if (editDebounce) { clearTimeout(editDebounce); editDebounce = null; }
+
+    const fullText = accumulated.trim();
+    if (exitCode !== 0) {
+      if (placeholderId) {
+        try { await editMessage("group", msg.group_openid, placeholderId, `Error (exit ${exitCode}): Claude session error`); } catch {}
       } else {
-        const chunks = splitMessage(text, 2000);
-        for (let i = 0; i < chunks.length; i++) {
-          await sendGroupMessage(msg.group_openid, chunks[i], i === 0 ? msg.id : undefined);
+        await sendGroupMessage(msg.group_openid, `Error (exit ${exitCode}): Claude session error`);
+      }
+    } else if (fullText) {
+      if (placeholderId) {
+        try { await editMessage("group", msg.group_openid, placeholderId, fullText.slice(0, 2000)); } catch {}
+        if (fullText.length > 2000) {
+          const remaining = fullText.slice(2000);
+          const chunks = splitMessage(remaining, 2000);
+          for (const chunk of chunks) {
+            await sendGroupMessage(msg.group_openid, chunk);
+          }
+        }
+      } else {
+        if (fullText.length <= 2000) {
+          await sendGroupMessage(msg.group_openid, fullText, msg.id);
+        } else {
+          const chunks = splitMessage(fullText, 2000);
+          for (let i = 0; i < chunks.length; i++) {
+            await sendGroupMessage(msg.group_openid, chunks[i], i === 0 ? msg.id : undefined);
+          }
         }
       }
+    } else if (!placeholderId) {
+      await sendGroupMessage(msg.group_openid, "(empty response)");
     }
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err);
@@ -462,22 +586,74 @@ async function handleGuildMessage(msg: GuildMessage): Promise<void> {
   try {
     await sendTyping(msg.channel_id, "channel");
     const prompt = buildPrompt(`${label} in guild:${msg.guild_id}`, content, imageUrl);
-    const result = await runUserMessage("qq", prompt);
 
-    if (result.exitCode !== 0) {
-      await sendGuildMessage(msg.channel_id, `Error (exit ${result.exitCode}): ${result.stderr || result.stdout || "Unknown error"}`);
-    } else {
-      const text = (result.stdout || "").trim();
-      if (!text) {
-        await sendGuildMessage(msg.channel_id, "(empty response)");
-      } else if (text.length <= 2000) {
-        await sendGuildMessage(msg.channel_id, text, msg.id);
+    let placeholderId: string | null = null;
+    let accumulated = "";
+    let editDebounce: ReturnType<typeof setTimeout> | null = null;
+
+    const onChunk = async (text: string) => {
+      accumulated += text;
+      if (!placeholderId && accumulated.trim()) {
+        try {
+          const token = await refreshAccessToken(config.appId, config.clientSecret);
+          const res = await fetch(`${QQ_API_BASE}/v2/channels/${msg.channel_id}/messages`, {
+            method: "POST",
+            headers: {
+              Authorization: `QQBot ${token}`,
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({ content: accumulated.trimEnd().slice(0, 2000), msg_type: 0, msg_id: msg.id }),
+          });
+          const data = (await res.json()) as { id?: string; msg_id?: string };
+          placeholderId = data.id ?? data.msg_id ?? null;
+        } catch {
+          placeholderId = null;
+        }
+        return;
+      }
+      if (editDebounce) clearTimeout(editDebounce);
+      editDebounce = setTimeout(async () => {
+        if (placeholderId) {
+          try { await editMessage("channel", msg.channel_id, placeholderId, accumulated.trimEnd().slice(0, 2000)); } catch { placeholderId = null; }
+        }
+        editDebounce = null;
+      }, 1500);
+    };
+
+    const onUnblock = () => {};
+    const exitCode = await streamUserMessage("qq", prompt, onChunk, onUnblock);
+
+    if (editDebounce) { clearTimeout(editDebounce); editDebounce = null; }
+
+    const fullText = accumulated.trim();
+    if (exitCode !== 0) {
+      if (placeholderId) {
+        try { await editMessage("channel", msg.channel_id, placeholderId, `Error (exit ${exitCode}): Claude session error`); } catch {}
       } else {
-        const chunks = splitMessage(text, 2000);
-        for (let i = 0; i < chunks.length; i++) {
-          await sendGuildMessage(msg.channel_id, chunks[i], i === 0 ? msg.id : undefined);
+        await sendGuildMessage(msg.channel_id, `Error (exit ${exitCode}): Claude session error`);
+      }
+    } else if (fullText) {
+      if (placeholderId) {
+        try { await editMessage("channel", msg.channel_id, placeholderId, fullText.slice(0, 2000)); } catch {}
+        if (fullText.length > 2000) {
+          const remaining = fullText.slice(2000);
+          const chunks = splitMessage(remaining, 2000);
+          for (const chunk of chunks) {
+            await sendGuildMessage(msg.channel_id, chunk);
+          }
+        }
+      } else {
+        if (fullText.length <= 2000) {
+          await sendGuildMessage(msg.channel_id, fullText, msg.id);
+        } else {
+          const chunks = splitMessage(fullText, 2000);
+          for (let i = 0; i < chunks.length; i++) {
+            await sendGuildMessage(msg.channel_id, chunks[i], i === 0 ? msg.id : undefined);
+          }
         }
       }
+    } else if (!placeholderId) {
+      await sendGuildMessage(msg.channel_id, "(empty response)");
     }
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err);

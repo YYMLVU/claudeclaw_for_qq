@@ -582,11 +582,15 @@ async function streamClaude(
   name: string,
   prompt: string,
   onChunk: (text: string) => void,
-  onUnblock: () => void
-): Promise<void> {
+  onUnblock: () => void,
+  threadId?: string,
+  idleTimeoutMs?: number,
+): Promise<number> {
   await mkdir(LOGS_DIR, { recursive: true });
 
-  const existing = await getSession();
+  const existing = threadId
+    ? await getThreadSession(threadId)
+    : await getSession();
   const { security, model, api } = getSettings();
   const securityArgs = buildSecurityArgs(security);
 
@@ -632,6 +636,27 @@ async function streamClaude(
   let buf = "";
   let unblocked = false;
   let textEmitted = false;
+  let killed = false;
+
+  // Idle timeout: kill process if no stdout activity for idleTimeoutMs.
+  // This is the root-cause fix for long-running tasks — as long as Claude
+  // produces output (even slowly), the process keeps running. Only truly
+  // stalled processes get killed.
+  const IDLE_TIMEOUT = idleTimeoutMs ?? 120_000; // default 2 min
+  let idleTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const resetIdleTimer = () => {
+    if (idleTimer) clearTimeout(idleTimer);
+    if (IDLE_TIMEOUT <= 0) return; // 0 or negative = no timeout
+    idleTimer = setTimeout(() => {
+      console.error(`[${new Date().toLocaleTimeString()}] Stream idle timeout: no output for ${IDLE_TIMEOUT / 1000}s — killing process`);
+      killed = true;
+      try { proc.kill("SIGTERM"); } catch {}
+      setTimeout(() => { try { proc.kill("SIGKILL"); } catch {} }, 5000);
+    }, IDLE_TIMEOUT);
+  };
+
+  resetIdleTimer();
 
   const maybeUnblock = () => {
     if (!unblocked) {
@@ -640,73 +665,91 @@ async function streamClaude(
     }
   };
 
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buf += decoder.decode(value, { stream: true });
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      resetIdleTimer(); // Reset on every stdout activity
+      buf += decoder.decode(value, { stream: true });
 
-    // Parse complete newline-delimited JSON events
-    const lines = buf.split("\n");
-    buf = lines.pop() ?? "";
+      // Parse complete newline-delimited JSON events
+      const lines = buf.split("\n");
+      buf = lines.pop() ?? "";
 
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
-      try {
-        const event = JSON.parse(trimmed) as Record<string, unknown>;
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        try {
+          const event = JSON.parse(trimmed) as Record<string, unknown>;
 
-        if (event.type === "system" && (event.subtype === "init" || event.session_id)) {
-          // Capture session ID for new sessions
-          const sid = event.session_id as string | undefined;
-          if (sid && !existing) {
-            await createSession(sid);
-            console.log(`[${new Date().toLocaleTimeString()}] Session created (stream-json): ${sid}`);
-          }
-        } else if (event.type === "assistant") {
-          // Text and tool_use blocks from the assistant
-          type ContentBlock = { type: string; text?: string; id?: string; name?: string; input?: Record<string, unknown> };
-          const msg = event.message as { content?: ContentBlock[] } | undefined;
-          const blocks = msg?.content ?? [];
-          let hasActivity = false;
-          for (const block of blocks) {
-            if (block.type === "text" && block.text) {
-              onChunk(block.text);
-              textEmitted = true;
-              hasActivity = true;
-            } else if (block.type === "tool_use") {
-              hasActivity = true;
+          if (event.type === "system" && (event.subtype === "init" || event.session_id)) {
+            // Capture session ID for new sessions
+            const sid = event.session_id as string | undefined;
+            if (sid && !existing) {
+              if (threadId) {
+                await createThreadSession(threadId, sid);
+                console.log(`[${new Date().toLocaleTimeString()}] Thread session created (stream-json): ${sid}`);
+              } else {
+                await createSession(sid);
+                console.log(`[${new Date().toLocaleTimeString()}] Session created (stream-json): ${sid}`);
+              }
             }
+          } else if (event.type === "assistant") {
+            // Text and tool_use blocks from the assistant
+            type ContentBlock = { type: string; text?: string; id?: string; name?: string; input?: Record<string, unknown> };
+            const msg = event.message as { content?: ContentBlock[] } | undefined;
+            const blocks = msg?.content ?? [];
+            let hasActivity = false;
+            for (const block of blocks) {
+              if (block.type === "text" && block.text) {
+                onChunk(block.text);
+                textEmitted = true;
+                hasActivity = true;
+              } else if (block.type === "tool_use") {
+                hasActivity = true;
+              }
+            }
+            if (hasActivity) maybeUnblock();
+          } else if (event.type === "tool_use") {
+            // Top-level tool_use event (some stream-json versions) — unblock the UI
+            maybeUnblock();
+          } else if (event.type === "result") {
+            // Final result event — emit text as fallback if no assistant text was seen
+            const resultText = (event as Record<string, unknown>).result as string | undefined;
+            if (resultText && !textEmitted) {
+              onChunk(resultText);
+            }
+            maybeUnblock();
           }
-          if (hasActivity) maybeUnblock();
-        } else if (event.type === "tool_use") {
-          // Top-level tool_use event (some stream-json versions) — unblock the UI
-          maybeUnblock();
-        } else if (event.type === "result") {
-          // Final result event — emit text as fallback if no assistant text was seen
-          const resultText = (event as Record<string, unknown>).result as string | undefined;
-          if (resultText && !textEmitted) {
-            onChunk(resultText);
-          }
-          maybeUnblock();
-        }
-      } catch {}
+        } catch {}
+      }
     }
+  } catch {
+    // reader.read() may throw if process was killed
   }
 
+  if (idleTimer) clearTimeout(idleTimer);
   await proc.exited;
   // Ensure unblock fires even if something unexpected happened
   maybeUnblock();
 
-  console.log(`[${new Date().toLocaleTimeString()}] Done: ${name}`);
+  const exitCode = proc.exitCode ?? (killed ? 124 : 1);
+  console.log(`[${new Date().toLocaleTimeString()}] Done: ${name} (exit ${exitCode})`);
+  return exitCode;
 }
 
 export async function streamUserMessage(
   name: string,
   prompt: string,
   onChunk: (text: string) => void,
-  onUnblock: () => void
-): Promise<void> {
-  return enqueue(() => streamClaude(name, prefixUserMessageWithClock(prompt), onChunk, onUnblock));
+  onUnblock: () => void,
+  threadId?: string,
+  idleTimeoutMs?: number,
+): Promise<number> {
+  return enqueue(
+    () => streamClaude(name, prefixUserMessageWithClock(prompt), onChunk, onUnblock, threadId, idleTimeoutMs),
+    threadId,
+  ) as unknown as Promise<number>;
 }
 
 function prefixUserMessageWithClock(prompt: string): string {
