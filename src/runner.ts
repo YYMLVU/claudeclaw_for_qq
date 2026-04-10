@@ -1,5 +1,6 @@
 import { mkdir, readFile, writeFile } from "fs/promises";
 import { join } from "path";
+import { homedir } from "os";
 import { existsSync } from "fs";
 import { getSession, createSession, incrementTurn, markCompactWarned } from "./sessions";
 import {
@@ -152,6 +153,7 @@ async function runClaudeOnce(
   if (model.trim() && normalizedModel !== "glm") args.push("--model", model.trim());
 
   const proc = Bun.spawn(args, {
+    cwd: TASK_WORK_DIR,
     stdout: "pipe",
     stderr: "pipe",
     env: buildChildEnv(baseEnv, model, api),
@@ -193,12 +195,13 @@ async function runClaudeOnce(
 }
 
 const PROJECT_DIR = process.cwd();
+const TASK_WORK_DIR = homedir();
 
 const DIR_SCOPE_PROMPT = [
-  `CRITICAL SECURITY CONSTRAINT: You are scoped to the project directory: ${PROJECT_DIR}`,
+  `CRITICAL SECURITY CONSTRAINT: You are scoped to the working directory: ${TASK_WORK_DIR}`,
   "You MUST NOT read, write, edit, or delete any file outside this directory.",
-  "You MUST NOT run bash commands that modify anything outside this directory (no cd /, no /etc, no ~/, no ../.. escapes).",
-  "If a request requires accessing files outside the project, refuse and explain why.",
+  "You MUST NOT run bash commands that modify anything outside this directory (no cd /, no /etc, no ../.. escapes).",
+  "If a request requires accessing files outside the working directory, refuse and explain why.",
 ].join("\n");
 
 export async function ensureProjectClaudeMd(): Promise<void> {
@@ -672,6 +675,7 @@ async function streamClaude(
   console.log(`[${new Date().toLocaleTimeString()}] Running: ${name} (stream-json, session: ${existing?.sessionId?.slice(0, 8) ?? "new"})`);
 
   const proc = Bun.spawn(args, {
+    cwd: TASK_WORK_DIR,
     stdout: "pipe",
     stderr: "pipe",
     env: childEnv,
