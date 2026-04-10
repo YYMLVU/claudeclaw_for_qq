@@ -13,6 +13,9 @@
  *   - Slash commands / interactions
  */
 
+import { homedir } from "os";
+import { join, dirname, basename } from "path";
+import { mkdir } from "fs/promises";
 import { streamUserMessage, parseTaskOverride } from "../runner";
 import { getSettings, loadSettings } from "../config";
 
@@ -237,6 +240,120 @@ async function editMessage(
       ? `/v2/groups/${channelId}/messages/${msgId}`
       : `/v2/channels/${channelId}/messages/${msgId}`;
   await qqApi(url, "PATCH", { content });
+}
+
+// --- File handling utilities ---
+
+const FILES_BASE_DIR = join(homedir(), ".claude", "claudeclaw", "tmp");
+
+function getFilesDir(sessionId: string): string {
+  return join(FILES_BASE_DIR, "input", sessionId);
+}
+
+function getOutputDir(sessionId: string): string {
+  return join(FILES_BASE_DIR, "output", sessionId);
+}
+
+function generateSessionId(): string {
+  return `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+/** Download a file from URL to local path */
+async function downloadFile(url: string, destPath: string): Promise<void> {
+  await mkdir(dirname(destPath), { recursive: true });
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Download failed: ${res.status}`);
+  const buf = await res.arrayBuffer();
+  await Bun.write(destPath, buf);
+}
+
+/** Get file_type number for QQ rich media API */
+function getFileType(contentType: string, filename: string): number {
+  if (contentType.startsWith("image/") || /\.(png|jpe?g|gif|webp)$/i.test(filename)) return 1;
+  if (contentType.startsWith("video/") || /\.mp4$/i.test(filename)) return 2;
+  if (contentType.startsWith("audio/") || /\.(silk|wav|mp3|flac)$/i.test(filename)) return 3;
+  return 4; // generic file (pdf, doc, txt, etc.)
+}
+
+/** Infer content type from filename */
+function getContentType(filename: string): string {
+  const ext = filename.split(".").pop()?.toLowerCase() ?? "";
+  const map: Record<string, string> = {
+    png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif", webp: "image/webp",
+    mp4: "video/mp4",
+    silk: "audio/silk", wav: "audio/wav", mp3: "audio/mpeg", flac: "audio/flac",
+    pdf: "application/pdf", doc: "application/msword", docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    txt: "text/plain", csv: "text/csv", json: "application/json",
+    zip: "application/zip",
+  };
+  return map[ext] ?? "application/octet-stream";
+}
+
+/** Upload a local file and send it as a rich media message (msg_type: 7) */
+async function uploadAndSendFile(
+  endpoint: "user" | "group" | "channel",
+  channelId: string,
+  filePath: string,
+): Promise<void> {
+  const fileData = await Bun.file(filePath).arrayBuffer();
+  const base64 = Buffer.from(fileData).toString("base64");
+  const filename = basename(filePath);
+  const contentType = getContentType(filename);
+  const fileType = getFileType(contentType, filename);
+
+  // Group/Channel: voice (3) and file (4) types are not supported by QQ API — skip
+  if (endpoint !== "user" && fileType >= 3) {
+    console.log(`[QQ] Skipping file send: type ${fileType} not supported in ${endpoint}`);
+    return;
+  }
+
+  // Channel endpoint: send directly with msg_type 7 (different upload mechanism)
+  if (endpoint === "channel") {
+    const sendBody: Record<string, unknown> = {
+      msg_type: 7,
+      media: {
+        file_info: JSON.stringify({ file_type: fileType, file_data: `base64://${base64}` }),
+      },
+    };
+    await qqApi(`/v2/channels/${channelId}/messages`, "POST", sendBody);
+    return;
+  }
+
+  // C2C / Group: upload file first, then send with file_info
+  const uploadPath = endpoint === "user"
+    ? `/v2/users/${channelId}/files`
+    : `/v2/groups/${channelId}/files`;
+
+  const uploadRes = await qqApi<{ file_info: string; file_uuid: string }>(
+    uploadPath, "POST", {
+      file_type: fileType,
+      file_data: `base64://${base64}`,
+      srv_send_msg: false,
+    },
+  );
+
+  // Send message with uploaded file reference
+  const sendPath = endpoint === "user"
+    ? `/v2/users/${channelId}/messages`
+    : `/v2/groups/${channelId}/messages`;
+
+  await qqApi(sendPath, "POST", {
+    msg_type: 7,
+    media: {
+      file_uuid: uploadRes.file_uuid,
+      file_info: uploadRes.file_info,
+    },
+  });
+}
+
+/** Recursively delete a directory */
+async function cleanupDir(dir: string): Promise<void> {
+  try {
+    const proc = Bun.spawn(["rm", "-rf", dir], { stdout: "pipe", stderr: "pipe" });
+    await proc.exited;
+  } catch {
+    // Cleanup is non-critical
+  }
 }
 
 // --- WebSocket helpers ---
