@@ -439,14 +439,11 @@ async function handleC2CMessage(msg: C2CMessage): Promise<void> {
           }
         }
       } else {
-        // Fallback: no placeholder was created, send as split messages
-        if (fullText.length <= 2000) {
-          await sendC2CMessage(msg.author.user_openid, fullText, msg.id);
-        } else {
-          const chunks = splitMessage(fullText, 2000);
-          for (let i = 0; i < chunks.length; i++) {
-            await sendC2CMessage(msg.author.user_openid, chunks[i], i === 0 ? msg.id : undefined);
-          }
+        // Fallback: no placeholder was created, send as split messages without msg_id
+        // to avoid QQ API dedup error (40054005) when msg_id was already consumed
+        const chunks = splitMessage(fullText, 2000);
+        for (const chunk of chunks) {
+          await sendC2CMessage(msg.author.user_openid, chunk);
         }
       }
     } else if (!placeholderId) {
@@ -548,13 +545,11 @@ async function handleGroupMessage(msg: GroupMessage): Promise<void> {
           }
         }
       } else {
-        if (fullText.length <= 2000) {
-          await sendGroupMessage(msg.group_openid, fullText, msg.id);
-        } else {
-          const chunks = splitMessage(fullText, 2000);
-          for (let i = 0; i < chunks.length; i++) {
-            await sendGroupMessage(msg.group_openid, chunks[i], i === 0 ? msg.id : undefined);
-          }
+        // Fallback: no placeholder was created, send as split messages without msg_id
+        // to avoid QQ API dedup error (40054005) when msg_id was already consumed
+        const chunks = splitMessage(fullText, 2000);
+        for (const chunk of chunks) {
+          await sendGroupMessage(msg.group_openid, chunk);
         }
       }
     } else if (!placeholderId) {
@@ -655,13 +650,11 @@ async function handleGuildMessage(msg: GuildMessage): Promise<void> {
           }
         }
       } else {
-        if (fullText.length <= 2000) {
-          await sendGuildMessage(msg.channel_id, fullText, msg.id);
-        } else {
-          const chunks = splitMessage(fullText, 2000);
-          for (let i = 0; i < chunks.length; i++) {
-            await sendGuildMessage(msg.channel_id, chunks[i], i === 0 ? msg.id : undefined);
-          }
+        // Fallback: no placeholder was created, send as split messages without msg_id
+        // to avoid QQ API dedup error (40054005) when msg_id was already consumed
+        const chunks = splitMessage(fullText, 2000);
+        for (const chunk of chunks) {
+          await sendGuildMessage(msg.channel_id, chunk);
         }
       }
     } else if (!placeholderId) {
