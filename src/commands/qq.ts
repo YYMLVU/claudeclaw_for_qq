@@ -549,6 +549,8 @@ async function handleC2CMessage(msg: C2CMessage): Promise<void> {
   try {
     await sendTyping(msg.author.user_openid, "user");
     const outputDir = getDefaultDownloadDir();
+    await mkdir(outputDir, { recursive: true });
+    const beforeEntries = new Set((await readdir(outputDir)).filter((entry) => !entry.startsWith(".")));
     const prompt = buildPrompt(label, effectiveContent, imageUrl, filePaths.length > 0 ? filePaths : undefined);
 
     let placeholderId: string | null = null;
@@ -628,13 +630,14 @@ async function handleC2CMessage(msg: C2CMessage): Promise<void> {
       await mkdir(outputDir, { recursive: true });
       const entries = await readdir(outputDir);
       const visibleEntries = entries.filter((entry) => !entry.startsWith("."));
-      console.log(`[QQ] Output scan for user ${label}: dir=${outputDir} entries=${visibleEntries.length}`);
-      if (visibleEntries.length === 0 && /(发送|发给我|导出|附件|文件|文档)/.test(content)) {
+      const newEntries = visibleEntries.filter((entry) => !beforeEntries.has(entry));
+      console.log(`[QQ] Output scan for user ${label}: dir=${toTildePath(outputDir)} entries=${visibleEntries.length} new=${newEntries.length}`);
+      if (newEntries.length === 0 && /(发送|发给我|导出|附件|文件|文档)/.test(content)) {
         try {
-          await sendC2CMessage(msg.author.user_openid, "Claude 没有生成可发送的文件。请明确要求它把真实文件写入输出目录后再发送。");
+          await sendC2CMessage(msg.author.user_openid, "Claude 没有生成可发送的新文件。请明确要求它把真实文件写入 ~/tmp/ 后再发送。");
         } catch {}
       }
-      for (const entry of visibleEntries) {
+      for (const entry of newEntries) {
         const fullPath = join(outputDir, entry);
         console.log(`[QQ] Sending result file to user ${label}: ${entry}`);
         try {
@@ -712,6 +715,8 @@ async function handleGroupMessage(msg: GroupMessage): Promise<void> {
   try {
     await sendTyping(msg.group_openid, "group");
     const outputDir = getDefaultDownloadDir();
+    await mkdir(outputDir, { recursive: true });
+    const beforeEntries = new Set((await readdir(outputDir)).filter((entry) => !entry.startsWith(".")));
     const prompt = buildPrompt(`${label} in ${groupLabel}`, groupEffectiveContent, imageUrl, filePaths.length > 0 ? filePaths : undefined);
 
     let placeholderId: string | null = null;
@@ -786,13 +791,14 @@ async function handleGroupMessage(msg: GroupMessage): Promise<void> {
       await mkdir(outputDir, { recursive: true });
       const entries = await readdir(outputDir);
       const visibleEntries = entries.filter((entry) => !entry.startsWith("."));
-      console.log(`[QQ] Output scan for group ${groupLabel}: dir=${outputDir} entries=${visibleEntries.length}`);
-      if (visibleEntries.length === 0 && /(发送|发给我|导出|附件|文件|文档)/.test(content)) {
+      const newEntries = visibleEntries.filter((entry) => !beforeEntries.has(entry));
+      console.log(`[QQ] Output scan for group ${groupLabel}: dir=${toTildePath(outputDir)} entries=${visibleEntries.length} new=${newEntries.length}`);
+      if (newEntries.length === 0 && /(发送|发给我|导出|附件|文件|文档)/.test(content)) {
         try {
-          await sendGroupMessage(msg.group_openid, "Claude 没有生成可发送的文件。请明确要求它把真实文件写入输出目录后再发送。");
+          await sendGroupMessage(msg.group_openid, "Claude 没有生成可发送的新文件。请明确要求它把真实文件写入 ~/tmp/ 后再发送。");
         } catch {}
       }
-      for (const entry of visibleEntries) {
+      for (const entry of newEntries) {
         const fullPath = join(outputDir, entry);
         console.log(`[QQ] Sending result file to group ${groupLabel}: ${entry}`);
         try {
@@ -869,6 +875,8 @@ async function handleGuildMessage(msg: GuildMessage): Promise<void> {
   try {
     await sendTyping(msg.channel_id, "channel");
     const outputDir = getDefaultDownloadDir();
+    await mkdir(outputDir, { recursive: true });
+    const beforeEntries = new Set((await readdir(outputDir)).filter((entry) => !entry.startsWith(".")));
     const prompt = buildPrompt(`${label} in guild:${msg.guild_id}`, guildEffectiveContent, imageUrl, filePaths.length > 0 ? filePaths : undefined);
 
     let placeholderId: string | null = null;
@@ -943,13 +951,14 @@ async function handleGuildMessage(msg: GuildMessage): Promise<void> {
       await mkdir(outputDir, { recursive: true });
       const entries = await readdir(outputDir);
       const visibleEntries = entries.filter((entry) => !entry.startsWith("."));
-      console.log(`[QQ] Output scan for guild ${msg.guild_id}: dir=${outputDir} entries=${visibleEntries.length}`);
-      if (visibleEntries.length === 0 && /(发送|发给我|导出|附件|文件|文档)/.test(content)) {
+      const newEntries = visibleEntries.filter((entry) => !beforeEntries.has(entry));
+      console.log(`[QQ] Output scan for guild ${msg.guild_id}: dir=${toTildePath(outputDir)} entries=${visibleEntries.length} new=${newEntries.length}`);
+      if (newEntries.length === 0 && /(发送|发给我|导出|附件|文件|文档)/.test(content)) {
         try {
-          await sendGuildMessage(msg.channel_id, "Claude 没有生成可发送的文件。请明确要求它把真实文件写入输出目录后再发送。");
+          await sendGuildMessage(msg.channel_id, "Claude 没有生成可发送的新文件。请明确要求它把真实文件写入 ~/tmp/ 后再发送。");
         } catch {}
       }
-      for (const entry of visibleEntries) {
+      for (const entry of newEntries) {
         const fullPath = join(outputDir, entry);
         console.log(`[QQ] Sending result file to guild ${msg.guild_id}: ${entry}`);
         try {
