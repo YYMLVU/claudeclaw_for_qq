@@ -13,9 +13,9 @@
  *   - Slash commands / interactions
  */
 
-import { homedir } from "os";
 import { join, dirname, basename } from "path";
 import { mkdir, readFile, writeFile, readdir } from "fs/promises";
+import { homedir } from "os";
 import { streamUserMessage, parseTaskOverride } from "../runner";
 import { getSettings, loadSettings } from "../config";
 
@@ -244,18 +244,31 @@ async function editMessage(
 
 // --- File handling utilities ---
 
-const FILES_BASE_DIR = join(homedir(), ".claude", "claudeclaw", "tmp");
+const HOME_DIR = homedir();
+const FILES_BASE_DIR = join(HOME_DIR, "tmp");
 
-function getFilesDir(sessionId: string): string {
-  return join(FILES_BASE_DIR, "input", sessionId);
+function getDefaultDownloadDir(): string {
+  return FILES_BASE_DIR;
 }
 
-function getOutputDir(sessionId: string): string {
-  return join(FILES_BASE_DIR, "output", sessionId);
+function expandHomePath(filePath: string): string {
+  if (filePath === "~") return HOME_DIR;
+  if (filePath.startsWith("~/")) return join(HOME_DIR, filePath.slice(2));
+  return filePath;
 }
 
-function generateSessionId(): string {
-  return `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+function toTildePath(filePath: string): string {
+  return filePath.startsWith(HOME_DIR) ? `~${filePath.slice(HOME_DIR.length)}` : filePath;
+}
+
+function isPathInsideHome(filePath: string): boolean {
+  const resolved = expandHomePath(filePath);
+  return resolved === HOME_DIR || resolved.startsWith(`${HOME_DIR}/`);
+}
+
+function buildDownloadedFilename(index: number, contentType: string): string {
+  const ext = contentType.split("/").pop()?.split(";")[0] ?? "bin";
+  return `qq-attachment-${Date.now()}-${index}.${ext}`;
 }
 
 /** Download a file from URL to local path */
@@ -312,7 +325,7 @@ async function uploadAndSendFile(
     const sendBody: Record<string, unknown> = {
       msg_type: 7,
       media: {
-        file_info: JSON.stringify({ file_type: fileType, file_data: `base64://${base64}` }),
+        file_info: JSON.stringify({ file_type: fileType, file_data: base64 }),
       },
     };
     await qqApi(`/v2/channels/${channelId}/messages`, "POST", sendBody);
@@ -327,7 +340,7 @@ async function uploadAndSendFile(
   const uploadRes = await qqApi<{ file_info: string; file_uuid: string }>(
     uploadPath, "POST", {
       file_type: fileType,
-      file_data: `base64://${base64}`,
+      file_data: base64,
       srv_send_msg: false,
     },
   );
@@ -461,6 +474,10 @@ function cleanContent(content: string): string {
   return content.replace(/<face[^>]*>.*?<\/face>/g, "").trim();
 }
 
+function wantsFileOutput(content: string): boolean {
+  return /(发送|发给我|导出|附件|文件|文档|txt|pdf|doc|生成一个.*文档|保存成.*文件)/i.test(content);
+}
+
 function buildPrompt(label: string, content: string, imageUrl?: string, filePaths?: string[], outputDir?: string): string {
   const parts = [`[QQ from ${label}]`];
   if (content.trim()) parts.push(`Message: ${content}`);
@@ -474,10 +491,13 @@ function buildPrompt(label: string, content: string, imageUrl?: string, filePath
       parts.push(`  - ${p}`);
     }
     parts.push("Read the file(s) and process them as requested by the user.");
-    if (outputDir) {
-      parts.push(`If you need to return a file as a result, save it to: ${outputDir}`);
-      parts.push("Supported return formats: images (png/jpg), documents (pdf/doc/txt), code files, data files (csv/json), etc.");
-    }
+  }
+  if (outputDir && ((filePaths && filePaths.length > 0) || wantsFileOutput(content))) {
+    parts.push(`If you need to return a file as a result, you MUST write the actual file into this directory: ${outputDir}`);
+    parts.push("Do not only say that you will send a file. Create the real file on disk in that directory so the bot can upload it.");
+    parts.push("If the user asks for a translated document, export a translated document file there.");
+    parts.push("If the user asks you to generate a document, create the file directly in that directory and then continue your response.");
+    parts.push("Supported return formats: images (png/jpg), documents (pdf/doc/txt), code files, data files (csv/json), etc.");
   }
   return parts.join("\n");
 }
@@ -493,26 +513,25 @@ async function handleC2CMessage(msg: C2CMessage): Promise<void> {
   }
 
   const content = cleanContent(msg.content);
-  if (!content && msg.attachments.length === 0) return;
+  if (!content && (msg.attachments ?? []).length === 0) return;
 
-  // Generate session ID for file temp directories
-  const fileSessionId = generateSessionId();
-  const inputDir = getFilesDir(fileSessionId);
-  const outputDir = getOutputDir(fileSessionId);
+  const downloadDir = getDefaultDownloadDir();
 
   // Determine image vs file attachment
-  const imageUrl = msg.attachments?.[0]?.url;
-  const nonImageAttachments = msg.attachments.filter(
+  const attachments = msg.attachments ?? [];
+  const imageUrl = attachments[0]?.url;
+  const nonImageAttachments = attachments.filter(
     (a) => !a.content_type.startsWith("image/"),
   );
+
+  await mkdir(downloadDir, { recursive: true });
 
   // Download non-image files
   const filePaths: string[] = [];
   for (const att of nonImageAttachments) {
     try {
-      const ext = att.content_type.split("/").pop()?.split(";")[0] ?? "bin";
-      const filename = `attachment-${filePaths.length}.${ext}`;
-      const destPath = join(inputDir, filename);
+      const filename = buildDownloadedFilename(filePaths.length, att.content_type);
+      const destPath = join(downloadDir, filename);
       await downloadFile(att.url, destPath);
       filePaths.push(destPath);
     } catch (err) {
@@ -603,28 +622,30 @@ async function handleC2CMessage(msg: C2CMessage): Promise<void> {
     }
 
     // Send result files from output directory
-    if (filePaths.length > 0) {
-      try {
-        await mkdir(outputDir, { recursive: true });
-        const entries = await readdir(outputDir);
-        for (const entry of entries) {
-          if (entry.startsWith(".")) continue;
-          const fullPath = join(outputDir, entry);
-          const stat = await Bun.file(fullPath).stat?.();
-          if (stat && stat.type === "file") {
-            try {
-              await uploadAndSendFile("user", msg.author.user_openid, fullPath);
-            } catch (err) {
-              console.error(`[QQ] Failed to send result file ${entry}: ${err instanceof Error ? err.message : err}`);
-              try {
-                await sendC2CMessage(msg.author.user_openid, `(文件发送失败: ${entry})`);
-              } catch {}
-            }
-          }
-        }
-      } catch {
-        // Output dir may not exist — that's fine
+    try {
+      await mkdir(outputDir, { recursive: true });
+      const entries = await readdir(outputDir);
+      const visibleEntries = entries.filter((entry) => !entry.startsWith("."));
+      console.log(`[QQ] Output scan for user ${label}: dir=${outputDir} entries=${visibleEntries.length}`);
+      if (visibleEntries.length === 0 && /(发送|发给我|导出|附件|文件|文档)/.test(content)) {
+        try {
+          await sendC2CMessage(msg.author.user_openid, "Claude 没有生成可发送的文件。请明确要求它把真实文件写入输出目录后再发送。");
+        } catch {}
       }
+      for (const entry of visibleEntries) {
+        const fullPath = join(outputDir, entry);
+        console.log(`[QQ] Sending result file to user ${label}: ${entry}`);
+        try {
+          await uploadAndSendFile("user", msg.author.user_openid, fullPath);
+        } catch (err) {
+          console.error(`[QQ] Failed to send result file ${entry}: ${err instanceof Error ? err.message : err}`);
+          try {
+            await sendC2CMessage(msg.author.user_openid, `(文件发送失败: ${entry})`);
+          } catch {}
+        }
+      }
+    } catch (err) {
+      console.error(`[QQ] Failed to scan output dir ${outputDir}: ${err instanceof Error ? err.message : err}`);
     }
 
     // Cleanup temp directories
@@ -657,26 +678,25 @@ async function handleGroupMessage(msg: GroupMessage): Promise<void> {
   }
 
   const content = cleanContent(msg.content);
-  if (!content && msg.attachments.length === 0) return;
+  if (!content && (msg.attachments ?? []).length === 0) return;
 
-  // Generate session ID for file temp directories
-  const fileSessionId = generateSessionId();
-  const inputDir = getFilesDir(fileSessionId);
-  const outputDir = getOutputDir(fileSessionId);
+  const downloadDir = getDefaultDownloadDir();
 
   // Determine image vs file attachment
-  const imageUrl = msg.attachments?.[0]?.url;
-  const nonImageAttachments = msg.attachments.filter(
+  const attachments = msg.attachments ?? [];
+  const imageUrl = attachments[0]?.url;
+  const nonImageAttachments = attachments.filter(
     (a) => !a.content_type.startsWith("image/"),
   );
+
+  await mkdir(downloadDir, { recursive: true });
 
   // Download non-image files
   const filePaths: string[] = [];
   for (const att of nonImageAttachments) {
     try {
-      const ext = att.content_type.split("/").pop()?.split(";")[0] ?? "bin";
-      const filename = `attachment-${filePaths.length}.${ext}`;
-      const destPath = join(inputDir, filename);
+      const filename = buildDownloadedFilename(filePaths.length, att.content_type);
+      const destPath = join(downloadDir, filename);
       await downloadFile(att.url, destPath);
       filePaths.push(destPath);
     } catch (err) {
@@ -762,28 +782,30 @@ async function handleGroupMessage(msg: GroupMessage): Promise<void> {
     }
 
     // Send result files from output directory
-    if (filePaths.length > 0) {
-      try {
-        await mkdir(outputDir, { recursive: true });
-        const entries = await readdir(outputDir);
-        for (const entry of entries) {
-          if (entry.startsWith(".")) continue;
-          const fullPath = join(outputDir, entry);
-          const stat = await Bun.file(fullPath).stat?.();
-          if (stat && stat.type === "file") {
-            try {
-              await uploadAndSendFile("group", msg.group_openid, fullPath);
-            } catch (err) {
-              console.error(`[QQ] Failed to send result file ${entry}: ${err instanceof Error ? err.message : err}`);
-              try {
-                await sendGroupMessage(msg.group_openid, `(文件发送失败: ${entry})`);
-              } catch {}
-            }
-          }
-        }
-      } catch {
-        // Output dir may not exist — that's fine
+    try {
+      await mkdir(outputDir, { recursive: true });
+      const entries = await readdir(outputDir);
+      const visibleEntries = entries.filter((entry) => !entry.startsWith("."));
+      console.log(`[QQ] Output scan for group ${groupLabel}: dir=${outputDir} entries=${visibleEntries.length}`);
+      if (visibleEntries.length === 0 && /(发送|发给我|导出|附件|文件|文档)/.test(content)) {
+        try {
+          await sendGroupMessage(msg.group_openid, "Claude 没有生成可发送的文件。请明确要求它把真实文件写入输出目录后再发送。");
+        } catch {}
       }
+      for (const entry of visibleEntries) {
+        const fullPath = join(outputDir, entry);
+        console.log(`[QQ] Sending result file to group ${groupLabel}: ${entry}`);
+        try {
+          await uploadAndSendFile("group", msg.group_openid, fullPath);
+        } catch (err) {
+          console.error(`[QQ] Failed to send result file ${entry}: ${err instanceof Error ? err.message : err}`);
+          try {
+            await sendGroupMessage(msg.group_openid, `(文件发送失败: ${entry})`);
+          } catch {}
+        }
+      }
+    } catch (err) {
+      console.error(`[QQ] Failed to scan output dir ${outputDir}: ${err instanceof Error ? err.message : err}`);
     }
 
     // Cleanup temp directories
@@ -815,26 +837,25 @@ async function handleGuildMessage(msg: GuildMessage): Promise<void> {
   }
 
   const content = cleanContent(msg.content);
-  if (!content && msg.attachments.length === 0) return;
+  if (!content && (msg.attachments ?? []).length === 0) return;
 
-  // Generate session ID for file temp directories
-  const fileSessionId = generateSessionId();
-  const inputDir = getFilesDir(fileSessionId);
-  const outputDir = getOutputDir(fileSessionId);
+  const downloadDir = getDefaultDownloadDir();
 
   // Determine image vs file attachment
-  const imageUrl = msg.attachments?.[0]?.url;
-  const nonImageAttachments = msg.attachments.filter(
+  const attachments = msg.attachments ?? [];
+  const imageUrl = attachments[0]?.url;
+  const nonImageAttachments = attachments.filter(
     (a) => !a.content_type.startsWith("image/"),
   );
+
+  await mkdir(downloadDir, { recursive: true });
 
   // Download non-image files
   const filePaths: string[] = [];
   for (const att of nonImageAttachments) {
     try {
-      const ext = att.content_type.split("/").pop()?.split(";")[0] ?? "bin";
-      const filename = `attachment-${filePaths.length}.${ext}`;
-      const destPath = join(inputDir, filename);
+      const filename = buildDownloadedFilename(filePaths.length, att.content_type);
+      const destPath = join(downloadDir, filename);
       await downloadFile(att.url, destPath);
       filePaths.push(destPath);
     } catch (err) {
@@ -920,28 +941,30 @@ async function handleGuildMessage(msg: GuildMessage): Promise<void> {
     }
 
     // Send result files from output directory
-    if (filePaths.length > 0) {
-      try {
-        await mkdir(outputDir, { recursive: true });
-        const entries = await readdir(outputDir);
-        for (const entry of entries) {
-          if (entry.startsWith(".")) continue;
-          const fullPath = join(outputDir, entry);
-          const stat = await Bun.file(fullPath).stat?.();
-          if (stat && stat.type === "file") {
-            try {
-              await uploadAndSendFile("channel", msg.channel_id, fullPath);
-            } catch (err) {
-              console.error(`[QQ] Failed to send result file ${entry}: ${err instanceof Error ? err.message : err}`);
-              try {
-                await sendGuildMessage(msg.channel_id, `(文件发送失败: ${entry})`);
-              } catch {}
-            }
-          }
-        }
-      } catch {
-        // Output dir may not exist — that's fine
+    try {
+      await mkdir(outputDir, { recursive: true });
+      const entries = await readdir(outputDir);
+      const visibleEntries = entries.filter((entry) => !entry.startsWith("."));
+      console.log(`[QQ] Output scan for guild ${msg.guild_id}: dir=${outputDir} entries=${visibleEntries.length}`);
+      if (visibleEntries.length === 0 && /(发送|发给我|导出|附件|文件|文档)/.test(content)) {
+        try {
+          await sendGuildMessage(msg.channel_id, "Claude 没有生成可发送的文件。请明确要求它把真实文件写入输出目录后再发送。");
+        } catch {}
       }
+      for (const entry of visibleEntries) {
+        const fullPath = join(outputDir, entry);
+        console.log(`[QQ] Sending result file to guild ${msg.guild_id}: ${entry}`);
+        try {
+          await uploadAndSendFile("channel", msg.channel_id, fullPath);
+        } catch (err) {
+          console.error(`[QQ] Failed to send result file ${entry}: ${err instanceof Error ? err.message : err}`);
+          try {
+            await sendGuildMessage(msg.channel_id, `(文件发送失败: ${entry})`);
+          } catch {}
+        }
+      }
+    } catch (err) {
+      console.error(`[QQ] Failed to scan output dir ${outputDir}: ${err instanceof Error ? err.message : err}`);
     }
 
     // Cleanup temp directories
