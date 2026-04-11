@@ -2,7 +2,7 @@ import { mkdir, readFile, writeFile } from "fs/promises";
 import { join } from "path";
 import { homedir } from "os";
 import { existsSync } from "fs";
-import { getSession, createSession, incrementTurn, markCompactWarned } from "./sessions";
+import { getSession, createSession, incrementTurn, markCompactWarned, resetSession } from "./sessions";
 import {
   getThreadSession,
   createThreadSession,
@@ -106,6 +106,14 @@ function extractRateLimitMessage(stdout: string, stderr: string): string | null 
     if (trimmed && RATE_LIMIT_PATTERN.test(trimmed)) return trimmed;
   }
   return null;
+}
+
+function isMissingResumeSessionError(stdout: string, stderr: string): boolean {
+  const candidates = [stdout, stderr];
+  for (const text of candidates) {
+    if (/No conversation found with session ID:/i.test(text)) return true;
+  }
+  return false;
 }
 
 function sameModelConfig(a: ModelConfig, b: ModelConfig): boolean {
@@ -491,6 +499,23 @@ async function execClaude(name: string, prompt: string, threadId?: string): Prom
   const baseEnv = { ...cleanEnv } as Record<string, string>;
 
   let exec = await runClaudeOnce(args, primaryConfig.model, primaryConfig.api, baseEnv, timeoutMs);
+  let resumedSessionBecameInvalid = false;
+
+  if (!isNew && isMissingResumeSessionError(exec.rawStdout, exec.stderr)) {
+    resumedSessionBecameInvalid = true;
+    console.warn(
+      `[${new Date().toLocaleTimeString()}] Stored Claude session ${existing.sessionId.slice(0, 8)} is invalid; resetting local session and retrying as new session...`
+    );
+    await resetSession();
+
+    const retryArgs = ["claude", "-p", effectivePrompt, "--output-format", "json", ...securityArgs];
+    if (appendParts.length > 0) {
+      retryArgs.push("--append-system-prompt", appendParts.join("\n\n"));
+    }
+
+    exec = await runClaudeOnce(retryArgs, primaryConfig.model, primaryConfig.api, baseEnv, timeoutMs);
+  }
+
   const primaryRateLimit = extractRateLimitMessage(exec.rawStdout, exec.stderr);
   let usedFallback = false;
 
@@ -514,7 +539,7 @@ async function execClaude(name: string, prompt: string, threadId?: string): Prom
   }
 
   // For new sessions, parse the JSON to extract session_id and result text
-  if (!rateLimitMessage && isNew && exitCode === 0) {
+  if (!rateLimitMessage && (isNew || resumedSessionBecameInvalid) && exitCode === 0) {
     try {
       const json = JSON.parse(rawStdout);
       sessionId = json.session_id;
