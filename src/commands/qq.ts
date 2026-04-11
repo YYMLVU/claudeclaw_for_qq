@@ -648,9 +648,6 @@ async function handleC2CMessage(msg: C2CMessage): Promise<void> {
       console.error(`[QQ] Failed to scan output dir ${outputDir}: ${err instanceof Error ? err.message : err}`);
     }
 
-    // Cleanup temp directories
-    await cleanupDir(inputDir);
-    await cleanupDir(outputDir);
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err);
     console.error(`[QQ] C2C error for ${label}: ${errMsg}`);
@@ -808,9 +805,6 @@ async function handleGroupMessage(msg: GroupMessage): Promise<void> {
       console.error(`[QQ] Failed to scan output dir ${outputDir}: ${err instanceof Error ? err.message : err}`);
     }
 
-    // Cleanup temp directories
-    await cleanupDir(inputDir);
-    await cleanupDir(outputDir);
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err);
     console.error(`[QQ] Group error for ${label}: ${errMsg}`);
@@ -967,9 +961,6 @@ async function handleGuildMessage(msg: GuildMessage): Promise<void> {
       console.error(`[QQ] Failed to scan output dir ${outputDir}: ${err instanceof Error ? err.message : err}`);
     }
 
-    // Cleanup temp directories
-    await cleanupDir(inputDir);
-    await cleanupDir(outputDir);
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err);
     console.error(`[QQ] Guild error for ${label}: ${errMsg}`);
