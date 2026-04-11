@@ -478,27 +478,28 @@ function wantsFileOutput(content: string): boolean {
   return /(发送|发给我|导出|附件|文件|文档|txt|pdf|doc|生成一个.*文档|保存成.*文件)/i.test(content);
 }
 
-function buildPrompt(label: string, content: string, imageUrl?: string, filePaths?: string[], outputDir?: string): string {
+function buildPrompt(label: string, content: string, imageUrl?: string, filePaths?: string[]): string {
   const parts = [`[QQ from ${label}]`];
   if (content.trim()) parts.push(`Message: ${content}`);
+
+  parts.push("QQ file workspace: received QQ attachments are downloaded into ~/tmp/");
+  parts.push("You may also read or write files anywhere under ~/ when needed.");
+  parts.push("If the user wants a file as output, create a real file under ~/tmp/ or another ~/ path.");
+  parts.push("Do not only describe the file — write the actual file to disk.");
+
   if (imageUrl) {
     parts.push(`Image URL: ${imageUrl}`);
     parts.push("The user attached an image. You can describe what you see or ask about it.");
   }
+
   if (filePaths && filePaths.length > 0) {
     parts.push(`The user attached ${filePaths.length > 1 ? "files" : "a file"}:`);
     for (const p of filePaths) {
-      parts.push(`  - ${p}`);
+      parts.push(`  - ${toTildePath(p)}`);
     }
     parts.push("Read the file(s) and process them as requested by the user.");
   }
-  if (outputDir && ((filePaths && filePaths.length > 0) || wantsFileOutput(content))) {
-    parts.push(`If you need to return a file as a result, you MUST write the actual file into this directory: ${outputDir}`);
-    parts.push("Do not only say that you will send a file. Create the real file on disk in that directory so the bot can upload it.");
-    parts.push("If the user asks for a translated document, export a translated document file there.");
-    parts.push("If the user asks you to generate a document, create the file directly in that directory and then continue your response.");
-    parts.push("Supported return formats: images (png/jpg), documents (pdf/doc/txt), code files, data files (csv/json), etc.");
-  }
+
   return parts.join("\n");
 }
 
@@ -547,7 +548,8 @@ async function handleC2CMessage(msg: C2CMessage): Promise<void> {
 
   try {
     await sendTyping(msg.author.user_openid, "user");
-    const prompt = buildPrompt(label, effectiveContent, imageUrl, filePaths.length > 0 ? filePaths : undefined, outputDir);
+    const outputDir = getDefaultDownloadDir();
+    const prompt = buildPrompt(label, effectiveContent, imageUrl, filePaths.length > 0 ? filePaths : undefined);
 
     let placeholderId: string | null = null;
     let accumulated = "";
@@ -709,7 +711,8 @@ async function handleGroupMessage(msg: GroupMessage): Promise<void> {
 
   try {
     await sendTyping(msg.group_openid, "group");
-    const prompt = buildPrompt(`${label} in ${groupLabel}`, groupEffectiveContent, imageUrl, filePaths.length > 0 ? filePaths : undefined, outputDir);
+    const outputDir = getDefaultDownloadDir();
+    const prompt = buildPrompt(`${label} in ${groupLabel}`, groupEffectiveContent, imageUrl, filePaths.length > 0 ? filePaths : undefined);
 
     let placeholderId: string | null = null;
     let accumulated = "";
@@ -865,7 +868,8 @@ async function handleGuildMessage(msg: GuildMessage): Promise<void> {
 
   try {
     await sendTyping(msg.channel_id, "channel");
-    const prompt = buildPrompt(`${label} in guild:${msg.guild_id}`, guildEffectiveContent, imageUrl, filePaths.length > 0 ? filePaths : undefined, outputDir);
+    const outputDir = getDefaultDownloadDir();
+    const prompt = buildPrompt(`${label} in guild:${msg.guild_id}`, guildEffectiveContent, imageUrl, filePaths.length > 0 ? filePaths : undefined);
 
     let placeholderId: string | null = null;
     let accumulated = "";
