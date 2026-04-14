@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { homedir } from "os";
-import { buildPrompt, extractDeclaredSendFiles, isAllowedSendFilePath, stripDeclaredSendFilesBlock } from "./qq";
+import { buildPrompt, extractDeclaredSendFiles, formatSendFileHint, isAllowedSendFilePath, stripDeclaredSendFilesBlock } from "./qq";
 
 const home = homedir();
 
@@ -48,5 +48,15 @@ describe("stripDeclaredSendFilesBlock", () => {
 
   test("leaves plain text unchanged", () => {
     expect(stripDeclaredSendFilesBlock("Summary here")).toBe("Summary here");
+  });
+});
+
+describe("formatSendFileHint", () => {
+  test("formats a basename hint for the outgoing file", () => {
+    expect(formatSendFileHint("/home/xiao/tmp/report.pdf")).toBe("文件名：report.pdf");
+  });
+
+  test("keeps the original extension in the hint", () => {
+    expect(formatSendFileHint("/home/xiao/work/archive.tar.gz")).toBe("文件名：archive.tar.gz");
   });
 });

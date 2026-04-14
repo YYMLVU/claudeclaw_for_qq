@@ -288,6 +288,10 @@ function isAllowedSendFilePath(filePath: string): boolean {
   return normalized === HOME_DIR || normalized.startsWith(`${HOME_DIR}/`);
 }
 
+function formatSendFileHint(filePath: string): string {
+  return `文件名：${basename(filePath)}`;
+}
+
 function buildDownloadedFilename(index: number, contentType: string): string {
   const ext = contentType.split("/").pop()?.split(";")[0] ?? "bin";
   return `qq-attachment-${Date.now()}-${index}.${ext}`;
@@ -670,6 +674,9 @@ async function handleC2CMessage(msg: C2CMessage): Promise<void> {
       }
 
       try {
+        try {
+          await sendC2CMessage(msg.author.user_openid, formatSendFileHint(filePath));
+        } catch {}
         await uploadAndSendFile("user", msg.author.user_openid, filePath);
       } catch (err) {
         console.error(`[QQ] Failed to send declared file ${filePath}: ${err instanceof Error ? err.message : err}`);
@@ -836,6 +843,9 @@ async function handleGroupMessage(msg: GroupMessage): Promise<void> {
       }
 
       try {
+        try {
+          await sendGroupMessage(msg.group_openid, formatSendFileHint(filePath));
+        } catch {}
         await uploadAndSendFile("group", msg.group_openid, filePath);
       } catch (err) {
         console.error(`[QQ] Failed to send declared file ${filePath}: ${err instanceof Error ? err.message : err}`);
@@ -1001,6 +1011,9 @@ async function handleGuildMessage(msg: GuildMessage): Promise<void> {
       }
 
       try {
+        try {
+          await sendGuildMessage(msg.channel_id, formatSendFileHint(filePath));
+        } catch {}
         await uploadAndSendFile("channel", msg.channel_id, filePath);
       } catch (err) {
         console.error(`[QQ] Failed to send declared file ${filePath}: ${err instanceof Error ? err.message : err}`);
@@ -1238,7 +1251,7 @@ async function connectGateway(): Promise<void> {
 
 // --- Public API ---
 
-export { buildPrompt, extractDeclaredSendFiles, isAllowedSendFilePath, stripDeclaredSendFilesBlock };
+export { buildPrompt, extractDeclaredSendFiles, formatSendFileHint, isAllowedSendFilePath, stripDeclaredSendFilesBlock };
 
 /** Send a message to a QQ user (C2C) by union_openid. */
 export async function sendMessageToUser(token: string, openid: string, text: string): Promise<void> {
