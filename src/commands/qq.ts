@@ -13,8 +13,8 @@
  *   - Slash commands / interactions
  */
 
-import { join, dirname, basename } from "path";
-import { mkdir, readFile, writeFile, readdir } from "fs/promises";
+import { join, dirname, basename, resolve } from "path";
+import { mkdir, readFile, writeFile, stat } from "fs/promises";
 import { homedir } from "os";
 import { streamUserMessage, parseTaskOverride } from "../runner";
 import { getSettings, loadSettings } from "../config";
@@ -266,6 +266,28 @@ function isPathInsideHome(filePath: string): boolean {
   return resolved === HOME_DIR || resolved.startsWith(`${HOME_DIR}/`);
 }
 
+function extractDeclaredSendFiles(text: string): string[] {
+  const match = text.match(/<qq-send-files>\s*([\s\S]*?)\s*<\/qq-send-files>/i);
+  if (!match) return [];
+  return match[1]
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+}
+
+function normalizeDeclaredSendFile(filePath: string): string {
+  return resolve(expandHomePath(filePath));
+}
+
+function stripDeclaredSendFilesBlock(text: string): string {
+  return text.replace(/\n?<qq-send-files>\s*[\s\S]*?\s*<\/qq-send-files>/i, "").trim();
+}
+
+function isAllowedSendFilePath(filePath: string): boolean {
+  const normalized = normalizeDeclaredSendFile(filePath);
+  return normalized === HOME_DIR || normalized.startsWith(`${HOME_DIR}/`);
+}
+
 function buildDownloadedFilename(index: number, contentType: string): string {
   const ext = contentType.split("/").pop()?.split(";")[0] ?? "bin";
   return `qq-attachment-${Date.now()}-${index}.${ext}`;
@@ -474,10 +496,6 @@ function cleanContent(content: string): string {
   return content.replace(/<face[^>]*>.*?<\/face>/g, "").trim();
 }
 
-function wantsFileOutput(content: string): boolean {
-  return /(发送|发给我|导出|附件|文件|文档|txt|pdf|doc|生成一个.*文档|保存成.*文件)/i.test(content);
-}
-
 function buildPrompt(label: string, content: string, imageUrl?: string, filePaths?: string[]): string {
   const parts = [`[QQ from ${label}]`];
   if (content.trim()) parts.push(`Message: ${content}`);
@@ -486,6 +504,11 @@ function buildPrompt(label: string, content: string, imageUrl?: string, filePath
   parts.push("You may also read or write files anywhere under ~/ when needed.");
   parts.push("If the user wants a file as output, create a real file under ~/tmp/ or another ~/ path.");
   parts.push("Do not only describe the file — write the actual file to disk.");
+  parts.push("If you want QQ to send files, write the real file to disk first.");
+  parts.push("Then append a <qq-send-files> block to your final response.");
+  parts.push("Inside that block, put one absolute file path per line.");
+  parts.push("Only list files that already exist under ~/.");
+  parts.push("Do not mention a file-send block unless QQ should actually send those files.");
 
   if (imageUrl) {
     parts.push(`Image URL: ${imageUrl}`);
@@ -548,9 +571,6 @@ async function handleC2CMessage(msg: C2CMessage): Promise<void> {
 
   try {
     await sendTyping(msg.author.user_openid, "user");
-    const outputDir = getDefaultDownloadDir();
-    await mkdir(outputDir, { recursive: true });
-    const beforeEntries = new Set((await readdir(outputDir)).filter((entry) => !entry.startsWith(".")));
     const prompt = buildPrompt(label, effectiveContent, imageUrl, filePaths.length > 0 ? filePaths : undefined);
 
     let placeholderId: string | null = null;
@@ -595,28 +615,25 @@ async function handleC2CMessage(msg: C2CMessage): Promise<void> {
 
     // If placeholder was set, do final edit. Otherwise send the full text.
     const fullText = accumulated.trim();
+    const displayText = stripDeclaredSendFilesBlock(fullText);
     if (exitCode !== 0) {
       if (placeholderId) {
         try { await editMessage("user", msg.author.user_openid, placeholderId, `Error (exit ${exitCode}): Claude session error`); } catch {}
       } else {
         await sendC2CMessage(msg.author.user_openid, `Error (exit ${exitCode}): Claude session error`);
       }
-    } else if (fullText) {
+    } else if (displayText) {
       if (placeholderId) {
-        const displayText = fullText.slice(0, 2000);
-        try { await editMessage("user", msg.author.user_openid, placeholderId, displayText); } catch {}
-        // Send overflow as new messages
-        if (fullText.length > 2000) {
-          const remaining = fullText.slice(2000);
+        try { await editMessage("user", msg.author.user_openid, placeholderId, displayText.slice(0, 2000)); } catch {}
+        if (displayText.length > 2000) {
+          const remaining = displayText.slice(2000);
           const chunks = splitMessage(remaining, 2000);
           for (const chunk of chunks) {
             await sendC2CMessage(msg.author.user_openid, chunk);
           }
         }
       } else {
-        // Fallback: no placeholder was created, send as split messages without msg_id
-        // to avoid QQ API dedup error (40054005) when msg_id was already consumed
-        const chunks = splitMessage(fullText, 2000);
+        const chunks = splitMessage(displayText, 2000);
         for (const chunk of chunks) {
           await sendC2CMessage(msg.author.user_openid, chunk);
         }
@@ -625,32 +642,41 @@ async function handleC2CMessage(msg: C2CMessage): Promise<void> {
       await sendC2CMessage(msg.author.user_openid, "(empty response)");
     }
 
-    // Send result files from output directory
-    try {
-      await mkdir(outputDir, { recursive: true });
-      const entries = await readdir(outputDir);
-      const visibleEntries = entries.filter((entry) => !entry.startsWith("."));
-      const newEntries = visibleEntries.filter((entry) => !beforeEntries.has(entry));
-      console.log(`[QQ] Output scan for user ${label}: dir=${toTildePath(outputDir)} entries=${visibleEntries.length} new=${newEntries.length}`);
-      if (newEntries.length === 0 && /(发送|发给我|导出|附件|文件|文档)/.test(content)) {
+    const declaredFiles = [...new Set(extractDeclaredSendFiles(fullText).map(normalizeDeclaredSendFile))];
+    console.log(`[QQ] Declared files for user ${label}: ${declaredFiles.length}`);
+    for (const filePath of declaredFiles) {
+      if (!isAllowedSendFilePath(filePath)) {
         try {
-          await sendC2CMessage(msg.author.user_openid, "Claude 没有生成可发送的新文件。请明确要求它把真实文件写入 ~/tmp/ 后再发送。");
+          await sendC2CMessage(msg.author.user_openid, `Claude 请求发送的文件超出允许范围: ${toTildePath(filePath)}`);
+        } catch {}
+        continue;
+      }
+
+      let fileInfo;
+      try {
+        fileInfo = await stat(filePath);
+      } catch {
+        try {
+          await sendC2CMessage(msg.author.user_openid, `Claude 请求发送文件，但文件不存在: ${toTildePath(filePath)}`);
+        } catch {}
+        continue;
+      }
+
+      if (!fileInfo.isFile()) {
+        try {
+          await sendC2CMessage(msg.author.user_openid, `Claude 请求发送的路径不是普通文件: ${toTildePath(filePath)}`);
+        } catch {}
+        continue;
+      }
+
+      try {
+        await uploadAndSendFile("user", msg.author.user_openid, filePath);
+      } catch (err) {
+        console.error(`[QQ] Failed to send declared file ${filePath}: ${err instanceof Error ? err.message : err}`);
+        try {
+          await sendC2CMessage(msg.author.user_openid, `(文件发送失败: ${basename(filePath)})`);
         } catch {}
       }
-      for (const entry of newEntries) {
-        const fullPath = join(outputDir, entry);
-        console.log(`[QQ] Sending result file to user ${label}: ${entry}`);
-        try {
-          await uploadAndSendFile("user", msg.author.user_openid, fullPath);
-        } catch (err) {
-          console.error(`[QQ] Failed to send result file ${entry}: ${err instanceof Error ? err.message : err}`);
-          try {
-            await sendC2CMessage(msg.author.user_openid, `(文件发送失败: ${entry})`);
-          } catch {}
-        }
-      }
-    } catch (err) {
-      console.error(`[QQ] Failed to scan output dir ${outputDir}: ${err instanceof Error ? err.message : err}`);
     }
 
   } catch (err) {
@@ -714,9 +740,6 @@ async function handleGroupMessage(msg: GroupMessage): Promise<void> {
 
   try {
     await sendTyping(msg.group_openid, "group");
-    const outputDir = getDefaultDownloadDir();
-    await mkdir(outputDir, { recursive: true });
-    const beforeEntries = new Set((await readdir(outputDir)).filter((entry) => !entry.startsWith(".")));
     const prompt = buildPrompt(`${label} in ${groupLabel}`, groupEffectiveContent, imageUrl, filePaths.length > 0 ? filePaths : undefined);
 
     let placeholderId: string | null = null;
@@ -758,26 +781,25 @@ async function handleGroupMessage(msg: GroupMessage): Promise<void> {
     if (editDebounce) { clearTimeout(editDebounce); editDebounce = null; }
 
     const fullText = accumulated.trim();
+    const displayText = stripDeclaredSendFilesBlock(fullText);
     if (exitCode !== 0) {
       if (placeholderId) {
         try { await editMessage("group", msg.group_openid, placeholderId, `Error (exit ${exitCode}): Claude session error`); } catch {}
       } else {
         await sendGroupMessage(msg.group_openid, `Error (exit ${exitCode}): Claude session error`);
       }
-    } else if (fullText) {
+    } else if (displayText) {
       if (placeholderId) {
-        try { await editMessage("group", msg.group_openid, placeholderId, fullText.slice(0, 2000)); } catch {}
-        if (fullText.length > 2000) {
-          const remaining = fullText.slice(2000);
+        try { await editMessage("group", msg.group_openid, placeholderId, displayText.slice(0, 2000)); } catch {}
+        if (displayText.length > 2000) {
+          const remaining = displayText.slice(2000);
           const chunks = splitMessage(remaining, 2000);
           for (const chunk of chunks) {
             await sendGroupMessage(msg.group_openid, chunk);
           }
         }
       } else {
-        // Fallback: no placeholder was created, send as split messages without msg_id
-        // to avoid QQ API dedup error (40054005) when msg_id was already consumed
-        const chunks = splitMessage(fullText, 2000);
+        const chunks = splitMessage(displayText, 2000);
         for (const chunk of chunks) {
           await sendGroupMessage(msg.group_openid, chunk);
         }
@@ -786,32 +808,41 @@ async function handleGroupMessage(msg: GroupMessage): Promise<void> {
       await sendGroupMessage(msg.group_openid, "(empty response)");
     }
 
-    // Send result files from output directory
-    try {
-      await mkdir(outputDir, { recursive: true });
-      const entries = await readdir(outputDir);
-      const visibleEntries = entries.filter((entry) => !entry.startsWith("."));
-      const newEntries = visibleEntries.filter((entry) => !beforeEntries.has(entry));
-      console.log(`[QQ] Output scan for group ${groupLabel}: dir=${toTildePath(outputDir)} entries=${visibleEntries.length} new=${newEntries.length}`);
-      if (newEntries.length === 0 && /(发送|发给我|导出|附件|文件|文档)/.test(content)) {
+    const declaredFiles = [...new Set(extractDeclaredSendFiles(fullText).map(normalizeDeclaredSendFile))];
+    console.log(`[QQ] Declared files for group ${groupLabel}: ${declaredFiles.length}`);
+    for (const filePath of declaredFiles) {
+      if (!isAllowedSendFilePath(filePath)) {
         try {
-          await sendGroupMessage(msg.group_openid, "Claude 没有生成可发送的新文件。请明确要求它把真实文件写入 ~/tmp/ 后再发送。");
+          await sendGroupMessage(msg.group_openid, `Claude 请求发送的文件超出允许范围: ${toTildePath(filePath)}`);
+        } catch {}
+        continue;
+      }
+
+      let fileInfo;
+      try {
+        fileInfo = await stat(filePath);
+      } catch {
+        try {
+          await sendGroupMessage(msg.group_openid, `Claude 请求发送文件，但文件不存在: ${toTildePath(filePath)}`);
+        } catch {}
+        continue;
+      }
+
+      if (!fileInfo.isFile()) {
+        try {
+          await sendGroupMessage(msg.group_openid, `Claude 请求发送的路径不是普通文件: ${toTildePath(filePath)}`);
+        } catch {}
+        continue;
+      }
+
+      try {
+        await uploadAndSendFile("group", msg.group_openid, filePath);
+      } catch (err) {
+        console.error(`[QQ] Failed to send declared file ${filePath}: ${err instanceof Error ? err.message : err}`);
+        try {
+          await sendGroupMessage(msg.group_openid, `(文件发送失败: ${basename(filePath)})`);
         } catch {}
       }
-      for (const entry of newEntries) {
-        const fullPath = join(outputDir, entry);
-        console.log(`[QQ] Sending result file to group ${groupLabel}: ${entry}`);
-        try {
-          await uploadAndSendFile("group", msg.group_openid, fullPath);
-        } catch (err) {
-          console.error(`[QQ] Failed to send result file ${entry}: ${err instanceof Error ? err.message : err}`);
-          try {
-            await sendGroupMessage(msg.group_openid, `(文件发送失败: ${entry})`);
-          } catch {}
-        }
-      }
-    } catch (err) {
-      console.error(`[QQ] Failed to scan output dir ${outputDir}: ${err instanceof Error ? err.message : err}`);
     }
 
   } catch (err) {
@@ -874,9 +905,6 @@ async function handleGuildMessage(msg: GuildMessage): Promise<void> {
 
   try {
     await sendTyping(msg.channel_id, "channel");
-    const outputDir = getDefaultDownloadDir();
-    await mkdir(outputDir, { recursive: true });
-    const beforeEntries = new Set((await readdir(outputDir)).filter((entry) => !entry.startsWith(".")));
     const prompt = buildPrompt(`${label} in guild:${msg.guild_id}`, guildEffectiveContent, imageUrl, filePaths.length > 0 ? filePaths : undefined);
 
     let placeholderId: string | null = null;
@@ -918,26 +946,25 @@ async function handleGuildMessage(msg: GuildMessage): Promise<void> {
     if (editDebounce) { clearTimeout(editDebounce); editDebounce = null; }
 
     const fullText = accumulated.trim();
+    const displayText = stripDeclaredSendFilesBlock(fullText);
     if (exitCode !== 0) {
       if (placeholderId) {
         try { await editMessage("channel", msg.channel_id, placeholderId, `Error (exit ${exitCode}): Claude session error`); } catch {}
       } else {
         await sendGuildMessage(msg.channel_id, `Error (exit ${exitCode}): Claude session error`);
       }
-    } else if (fullText) {
+    } else if (displayText) {
       if (placeholderId) {
-        try { await editMessage("channel", msg.channel_id, placeholderId, fullText.slice(0, 2000)); } catch {}
-        if (fullText.length > 2000) {
-          const remaining = fullText.slice(2000);
+        try { await editMessage("channel", msg.channel_id, placeholderId, displayText.slice(0, 2000)); } catch {}
+        if (displayText.length > 2000) {
+          const remaining = displayText.slice(2000);
           const chunks = splitMessage(remaining, 2000);
           for (const chunk of chunks) {
             await sendGuildMessage(msg.channel_id, chunk);
           }
         }
       } else {
-        // Fallback: no placeholder was created, send as split messages without msg_id
-        // to avoid QQ API dedup error (40054005) when msg_id was already consumed
-        const chunks = splitMessage(fullText, 2000);
+        const chunks = splitMessage(displayText, 2000);
         for (const chunk of chunks) {
           await sendGuildMessage(msg.channel_id, chunk);
         }
@@ -946,32 +973,41 @@ async function handleGuildMessage(msg: GuildMessage): Promise<void> {
       await sendGuildMessage(msg.channel_id, "(empty response)");
     }
 
-    // Send result files from output directory
-    try {
-      await mkdir(outputDir, { recursive: true });
-      const entries = await readdir(outputDir);
-      const visibleEntries = entries.filter((entry) => !entry.startsWith("."));
-      const newEntries = visibleEntries.filter((entry) => !beforeEntries.has(entry));
-      console.log(`[QQ] Output scan for guild ${msg.guild_id}: dir=${toTildePath(outputDir)} entries=${visibleEntries.length} new=${newEntries.length}`);
-      if (newEntries.length === 0 && /(发送|发给我|导出|附件|文件|文档)/.test(content)) {
+    const declaredFiles = [...new Set(extractDeclaredSendFiles(fullText).map(normalizeDeclaredSendFile))];
+    console.log(`[QQ] Declared files for guild ${msg.guild_id}: ${declaredFiles.length}`);
+    for (const filePath of declaredFiles) {
+      if (!isAllowedSendFilePath(filePath)) {
         try {
-          await sendGuildMessage(msg.channel_id, "Claude 没有生成可发送的新文件。请明确要求它把真实文件写入 ~/tmp/ 后再发送。");
+          await sendGuildMessage(msg.channel_id, `Claude 请求发送的文件超出允许范围: ${toTildePath(filePath)}`);
+        } catch {}
+        continue;
+      }
+
+      let fileInfo;
+      try {
+        fileInfo = await stat(filePath);
+      } catch {
+        try {
+          await sendGuildMessage(msg.channel_id, `Claude 请求发送文件，但文件不存在: ${toTildePath(filePath)}`);
+        } catch {}
+        continue;
+      }
+
+      if (!fileInfo.isFile()) {
+        try {
+          await sendGuildMessage(msg.channel_id, `Claude 请求发送的路径不是普通文件: ${toTildePath(filePath)}`);
+        } catch {}
+        continue;
+      }
+
+      try {
+        await uploadAndSendFile("channel", msg.channel_id, filePath);
+      } catch (err) {
+        console.error(`[QQ] Failed to send declared file ${filePath}: ${err instanceof Error ? err.message : err}`);
+        try {
+          await sendGuildMessage(msg.channel_id, `(文件发送失败: ${basename(filePath)})`);
         } catch {}
       }
-      for (const entry of newEntries) {
-        const fullPath = join(outputDir, entry);
-        console.log(`[QQ] Sending result file to guild ${msg.guild_id}: ${entry}`);
-        try {
-          await uploadAndSendFile("channel", msg.channel_id, fullPath);
-        } catch (err) {
-          console.error(`[QQ] Failed to send result file ${entry}: ${err instanceof Error ? err.message : err}`);
-          try {
-            await sendGuildMessage(msg.channel_id, `(文件发送失败: ${entry})`);
-          } catch {}
-        }
-      }
-    } catch (err) {
-      console.error(`[QQ] Failed to scan output dir ${outputDir}: ${err instanceof Error ? err.message : err}`);
     }
 
   } catch (err) {
@@ -1201,6 +1237,8 @@ async function connectGateway(): Promise<void> {
 }
 
 // --- Public API ---
+
+export { buildPrompt, extractDeclaredSendFiles, isAllowedSendFilePath, stripDeclaredSendFilesBlock };
 
 /** Send a message to a QQ user (C2C) by union_openid. */
 export async function sendMessageToUser(token: string, openid: string, text: string): Promise<void> {
