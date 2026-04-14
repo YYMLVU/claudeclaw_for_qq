@@ -16,6 +16,7 @@ const HEARTBEAT_DIR = join(CLAUDE_DIR, "claudeclaw");
 const STATUSLINE_FILE = join(CLAUDE_DIR, "statusline.cjs");
 const CLAUDE_SETTINGS_FILE = join(CLAUDE_DIR, "settings.json");
 const PREFLIGHT_SCRIPT = fileURLToPath(new URL("../preflight.ts", import.meta.url));
+const PROJECT_DIR = "/home/xiao/claudeclaw_for_qq";
 
 // --- Statusline setup/teardown ---
 
@@ -277,7 +278,7 @@ export async function start(args: string[] = []) {
     await initConfig();
     await loadSettings();
     await ensureProjectClaudeMd();
-    const result = await runUserMessage("prompt", payload);
+    const result = await runUserMessage("prompt", payload, undefined, PROJECT_DIR);
     console.log(result.stdout);
     if (result.exitCode !== 0) process.exit(result.exitCode);
     return;
@@ -489,7 +490,7 @@ export async function start(args: string[] = []) {
             console.log(`[${ts()}] Jobs reloaded from Web UI`);
           },
           onChat: async (message, onChunk, onUnblock) => {
-            await streamUserMessage("chat", message, onChunk, onUnblock);
+            await streamUserMessage("chat", message, onChunk, onUnblock, undefined, undefined, undefined, PROJECT_DIR);
           },
         });
       } catch (err) {
@@ -590,7 +591,7 @@ export async function start(args: string[] = []) {
             .filter((part) => part.length > 0)
             .join("\n\n");
           if (!mergedPrompt) return null;
-          return run("heartbeat", mergedPrompt);
+          return run("heartbeat", mergedPrompt, undefined, PROJECT_DIR);
         })
         .then((r) => {
           if (!r) return;
@@ -619,7 +620,7 @@ export async function start(args: string[] = []) {
   // - normal mode: bootstrap to initialize session context
   if (hasTriggerFlag) {
     const triggerPrompt = hasPromptFlag ? payload : "Wake up, my friend!";
-    const triggerResult = await run("trigger", triggerPrompt);
+    const triggerResult = await run("trigger", triggerPrompt, undefined, PROJECT_DIR);
     console.log(triggerResult.stdout);
     if (telegramFlag) forwardToTelegram("", triggerResult);
     if (discordFlag) forwardToDiscord("", triggerResult);
@@ -728,7 +729,7 @@ export async function start(args: string[] = []) {
     for (const job of currentJobs) {
       if (cronMatches(job.schedule, now, currentSettings.timezoneOffsetMinutes)) {
         resolvePrompt(job.prompt)
-          .then((prompt) => run(job.name, prompt))
+          .then((prompt) => run(job.name, prompt, undefined, PROJECT_DIR))
           .then((r) => {
             if (job.notify === false) return;
             if (job.notify === "error" && r.exitCode === 0) return;

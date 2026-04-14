@@ -14,6 +14,8 @@
  */
 
 import { join, dirname, basename, resolve } from "path";
+
+const PROJECT_DIR = "/home/xiao/claudeclaw_for_qq";
 import { mkdir, readFile, writeFile, stat } from "fs/promises";
 import { homedir } from "os";
 import { streamUserMessage, parseTaskOverride } from "../runner";
@@ -612,7 +614,7 @@ async function handleC2CMessage(msg: C2CMessage): Promise<void> {
 
     const onUnblock = () => {};
 
-    const exitCode = await streamUserMessage("qq", prompt, onChunk, onUnblock, undefined, undefined, taskModel ?? undefined);
+    const exitCode = await streamUserMessage("qq", prompt, onChunk, onUnblock, undefined, undefined, taskModel ?? undefined, PROJECT_DIR);
 
     // Flush any remaining debounced edit
     if (editDebounce) { clearTimeout(editDebounce); editDebounce = null; }
@@ -783,7 +785,7 @@ async function handleGroupMessage(msg: GroupMessage): Promise<void> {
     };
 
     const onUnblock = () => {};
-    const exitCode = await streamUserMessage("qq", prompt, onChunk, onUnblock, undefined, undefined, groupTaskModel ?? undefined);
+    const exitCode = await streamUserMessage("qq", prompt, onChunk, onUnblock, undefined, undefined, groupTaskModel ?? undefined, PROJECT_DIR);
 
     if (editDebounce) { clearTimeout(editDebounce); editDebounce = null; }
 
@@ -951,7 +953,7 @@ async function handleGuildMessage(msg: GuildMessage): Promise<void> {
     };
 
     const onUnblock = () => {};
-    const exitCode = await streamUserMessage("qq", prompt, onChunk, onUnblock, undefined, undefined, guildTaskModel ?? undefined);
+    const exitCode = await streamUserMessage("qq", prompt, onChunk, onUnblock, undefined, undefined, guildTaskModel ?? undefined, PROJECT_DIR);
 
     if (editDebounce) { clearTimeout(editDebounce); editDebounce = null; }
 

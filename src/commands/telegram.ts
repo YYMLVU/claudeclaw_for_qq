@@ -9,6 +9,8 @@ import { resolveSkillPrompt, listSkills } from "../skills";
 import { mkdir } from "node:fs/promises";
 import { extname, join } from "node:path";
 
+const PROJECT_DIR = "/home/xiao/claudeclaw_for_qq";
+
 // --- Markdown → Telegram HTML conversion (ported from nanobot) ---
 
 function markdownToTelegramHtml(text: string): string {
@@ -552,7 +554,7 @@ async function handleMyChatMember(update: TelegramMyChatMemberUpdate): Promise<v
     "Write a short first message for the group. It should confirm I was added and explain how to trigger me.";
 
   try {
-    const result = await run("telegram", eventPrompt);
+    const result = await run("telegram", eventPrompt, undefined, PROJECT_DIR);
     if (result.exitCode !== 0) {
       await sendMessage(config.token, chat.id, "I was added to this group. Mention me with a command to start.");
       return;
@@ -832,7 +834,7 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
       );
     }
     const prefixedPrompt = promptParts.join("\n");
-    const result = await runUserMessage("telegram", prefixedPrompt);
+    const result = await runUserMessage("telegram", prefixedPrompt, undefined, PROJECT_DIR);
 
     if (result.exitCode !== 0) {
       await sendMessage(config.token, chatId, `Error (exit ${result.exitCode}): ${result.stderr || "Unknown error"}`, threadId);

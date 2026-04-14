@@ -10,6 +10,8 @@ import { resolveSkillPrompt } from "../skills";
 import { mkdir } from "node:fs/promises";
 import { extname, join } from "node:path";
 
+const PROJECT_DIR = "/home/xiao/claudeclaw_for_qq";
+
 // --- Discord API constants ---
 
 const DISCORD_API = "https://discord.com/api/v10";
@@ -638,7 +640,7 @@ async function handleMessageCreate(token: string, message: DiscordMessage): Prom
     const prefixedPrompt = promptParts.join("\n");
     // Use thread-specific session if message is in a known thread
     const threadId = knownThreads.has(channelId) ? channelId : undefined;
-    const result = await runUserMessage("discord", prefixedPrompt, threadId);
+    const result = await runUserMessage("discord", prefixedPrompt, threadId, PROJECT_DIR);
 
     if (result.exitCode !== 0) {
       await sendMessage(config.token, channelId, `Error (exit ${result.exitCode}): ${result.stderr || result.stdout || "Unknown error"}`);
@@ -856,7 +858,7 @@ async function handleGuildCreate(token: string, guild: DiscordGuild): Promise<vo
     "Write a short first message for the server. Confirm I was added and explain how to trigger me (mention or reply).";
 
   try {
-    const result = await run("discord", eventPrompt);
+    const result = await run("discord", eventPrompt, undefined, PROJECT_DIR);
     if (result.exitCode !== 0) {
       await sendMessage(config.token, channelId, "I was added to this server. Mention me to start.");
       return;

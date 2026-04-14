@@ -154,14 +154,15 @@ async function runClaudeOnce(
   model: string,
   api: string,
   baseEnv: Record<string, string>,
-  timeoutMs: number = CLAUDE_TIMEOUT_MS
+  timeoutMs: number = CLAUDE_TIMEOUT_MS,
+  taskCwd?: string,
 ): Promise<{ rawStdout: string; stderr: string; exitCode: number }> {
   const args = [...baseArgs];
   const normalizedModel = model.trim().toLowerCase();
   if (model.trim() && normalizedModel !== "glm") args.push("--model", model.trim());
 
   const proc = Bun.spawn(args, {
-    cwd: TASK_WORK_DIR,
+    cwd: resolveTaskWorkDir(taskCwd),
     stdout: "pipe",
     stderr: "pipe",
     env: buildChildEnv(baseEnv, model, api),
@@ -203,10 +204,16 @@ async function runClaudeOnce(
 }
 
 const PROJECT_DIR = process.cwd();
-const TASK_WORK_DIR = homedir();
+
+function resolveTaskWorkDir(taskCwd?: string): string {
+  const trimmed = taskCwd?.trim();
+  if (!trimmed) return homedir();
+  const home = homedir();
+  return trimmed === home || trimmed.startsWith(`${home}/`) ? trimmed : home;
+}
 
 const DIR_SCOPE_PROMPT = [
-  `CRITICAL SECURITY CONSTRAINT: You are scoped to the working directory: ${TASK_WORK_DIR}`,
+  `CRITICAL SECURITY CONSTRAINT: You are scoped to the working directory: ${resolveTaskWorkDir(PROJECT_DIR)}`,
   "You MUST NOT read, write, edit, or delete any file outside this directory.",
   "You MUST NOT run bash commands that modify anything outside this directory (no cd /, no /etc, no ../.. escapes).",
   "If a request requires accessing files outside the working directory, refuse and explain why.",
@@ -365,7 +372,8 @@ export async function runCompact(
   api: string,
   baseEnv: Record<string, string>,
   securityArgs: string[],
-  timeoutMs: number
+  timeoutMs: number,
+  taskCwd?: string,
 ): Promise<boolean> {
   const compactArgs = [
     "claude", "-p", "/compact",
@@ -374,7 +382,7 @@ export async function runCompact(
     ...securityArgs,
   ];
   console.log(`[${new Date().toLocaleTimeString()}] Running /compact on session ${sessionId.slice(0, 8)}...`);
-  const result = await runClaudeOnce(compactArgs, model, api, baseEnv, timeoutMs);
+  const result = await runClaudeOnce(compactArgs, model, api, baseEnv, timeoutMs, taskCwd);
   const success = result.exitCode === 0;
   console.log(`[${new Date().toLocaleTimeString()}] Compact ${success ? "succeeded" : `failed (exit ${result.exitCode})`}`);
   return success;
@@ -408,7 +416,7 @@ export async function compactCurrentSession(): Promise<{ success: boolean; messa
     : { success: false, message: `❌ Compact failed (${existing.sessionId.slice(0, 8)})` };
 }
 
-async function execClaude(name: string, prompt: string, threadId?: string): Promise<RunResult> {
+async function execClaude(name: string, prompt: string, threadId?: string, taskCwd?: string): Promise<RunResult> {
   await mkdir(LOGS_DIR, { recursive: true });
 
   const existing = threadId
@@ -498,7 +506,7 @@ async function execClaude(name: string, prompt: string, threadId?: string): Prom
   const { CLAUDECODE: _, ...cleanEnv } = process.env;
   const baseEnv = { ...cleanEnv } as Record<string, string>;
 
-  let exec = await runClaudeOnce(args, primaryConfig.model, primaryConfig.api, baseEnv, timeoutMs);
+  let exec = await runClaudeOnce(args, primaryConfig.model, primaryConfig.api, baseEnv, timeoutMs, taskCwd);
   let resumedSessionBecameInvalid = false;
 
   if (!isNew && isMissingResumeSessionError(exec.rawStdout, exec.stderr)) {
@@ -513,7 +521,7 @@ async function execClaude(name: string, prompt: string, threadId?: string): Prom
       retryArgs.push("--append-system-prompt", appendParts.join("\n\n"));
     }
 
-    exec = await runClaudeOnce(retryArgs, primaryConfig.model, primaryConfig.api, baseEnv, timeoutMs);
+    exec = await runClaudeOnce(retryArgs, primaryConfig.model, primaryConfig.api, baseEnv, timeoutMs, taskCwd);
   }
 
   const primaryRateLimit = extractRateLimitMessage(exec.rawStdout, exec.stderr);
@@ -523,7 +531,7 @@ async function execClaude(name: string, prompt: string, threadId?: string): Prom
     console.warn(
       `[${new Date().toLocaleTimeString()}] Claude limit reached; retrying with fallback${fallbackConfig.model ? ` (${fallbackConfig.model})` : ""}...`
     );
-    exec = await runClaudeOnce(args, fallbackConfig.model, fallbackConfig.api, baseEnv, timeoutMs);
+    exec = await runClaudeOnce(args, fallbackConfig.model, fallbackConfig.api, baseEnv, timeoutMs, taskCwd);
     usedFallback = true;
   }
 
@@ -589,13 +597,14 @@ async function execClaude(name: string, prompt: string, threadId?: string): Prom
       primaryConfig.api,
       baseEnv,
       securityArgs,
-      timeoutMs
+      timeoutMs,
+      taskCwd
     );
     emitCompactEvent({ type: "auto-compact-done", success: compactOk });
 
     if (compactOk) {
       console.log(`[${new Date().toLocaleTimeString()}] Retrying ${name} after compact...`);
-      const retryExec = await runClaudeOnce(args, primaryConfig.model, primaryConfig.api, baseEnv, timeoutMs);
+      const retryExec = await runClaudeOnce(args, primaryConfig.model, primaryConfig.api, baseEnv, timeoutMs, taskCwd);
       const retryResult: RunResult = {
         stdout: retryExec.rawStdout,
         stderr: retryExec.stderr,
@@ -635,8 +644,10 @@ async function execClaude(name: string, prompt: string, threadId?: string): Prom
   return result;
 }
 
-export async function run(name: string, prompt: string, threadId?: string): Promise<RunResult> {
-  return enqueue(() => execClaude(name, prompt, threadId), threadId);
+export { resolveTaskWorkDir };
+
+export async function run(name: string, prompt: string, threadId?: string, taskCwd?: string): Promise<RunResult> {
+  return enqueue(() => execClaude(name, prompt, threadId, taskCwd), threadId);
 }
 
 async function streamClaude(
@@ -647,6 +658,7 @@ async function streamClaude(
   threadId?: string,
   idleTimeoutMs?: number,
   overrideModel?: string,
+  taskCwd?: string,
 ): Promise<number> {
   await mkdir(LOGS_DIR, { recursive: true });
 
@@ -700,7 +712,7 @@ async function streamClaude(
   console.log(`[${new Date().toLocaleTimeString()}] Running: ${name} (stream-json, session: ${existing?.sessionId?.slice(0, 8) ?? "new"})`);
 
   const proc = Bun.spawn(args, {
-    cwd: TASK_WORK_DIR,
+    cwd: resolveTaskWorkDir(taskCwd),
     stdout: "pipe",
     stderr: "pipe",
     env: childEnv,
@@ -821,9 +833,10 @@ export async function streamUserMessage(
   threadId?: string,
   idleTimeoutMs?: number,
   overrideModel?: string,
+  taskCwd?: string,
 ): Promise<number> {
   return enqueue(
-    () => streamClaude(name, prefixUserMessageWithClock(prompt), onChunk, onUnblock, threadId, idleTimeoutMs, overrideModel),
+    () => streamClaude(name, prefixUserMessageWithClock(prompt), onChunk, onUnblock, threadId, idleTimeoutMs, overrideModel, taskCwd),
     threadId,
   ) as unknown as Promise<number>;
 }
@@ -839,8 +852,8 @@ function prefixUserMessageWithClock(prompt: string): string {
   }
 }
 
-export async function runUserMessage(name: string, prompt: string, threadId?: string): Promise<RunResult> {
-  return run(name, prefixUserMessageWithClock(prompt), threadId);
+export async function runUserMessage(name: string, prompt: string, threadId?: string, taskCwd?: string): Promise<RunResult> {
+  return run(name, prefixUserMessageWithClock(prompt), threadId, taskCwd);
 }
 
 /**

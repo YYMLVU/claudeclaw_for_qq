@@ -1,4 +1,6 @@
 import { runUserMessage } from "../runner";
+
+const PROJECT_DIR = "/home/xiao/claudeclaw_for_qq";
 import { getSession } from "../sessions";
 import { loadSettings, initConfig } from "../config";
 
@@ -21,7 +23,7 @@ export async function send(args: string[]) {
     process.exit(1);
   }
 
-  const result = await runUserMessage("send", message);
+  const result = await runUserMessage("send", message, undefined, PROJECT_DIR);
   console.log(result.stdout);
 
   if (telegramFlag) {
