@@ -1,21 +1,26 @@
-import { readdir } from "fs/promises";
+import { mkdir, readdir } from "fs/promises";
 import { join } from "path";
 
 const JOBS_DIR = join(process.cwd(), ".claude", "claudeclaw", "jobs");
 
 export interface Job {
   name: string;
+  mode: "poll" | "launch";
   schedule: string;
   prompt: string;
   recurring: boolean;
   notify: true | false | "error";
+  targetChannel?: "qq";
+  targetType?: "private" | "group";
+  targetId?: string;
+  createdFrom?: "qq";
 }
 
 function parseFrontmatterValue(raw: string): string {
   return raw.trim().replace(/^["']|["']$/g, "");
 }
 
-function parseJobFile(name: string, content: string): Job | null {
+export function parseJobFile(name: string, content: string): Job | null {
   const match = content.match(/^---\s*\n([\s\S]*?)\n---\s*\n([\s\S]*)$/);
   if (!match) {
     console.error(`Invalid job file format: ${name}`);
@@ -32,6 +37,10 @@ function parseJobFile(name: string, content: string): Job | null {
   }
 
   const schedule = parseFrontmatterValue(scheduleLine.replace("schedule:", ""));
+
+  const modeLine = lines.find((l) => l.startsWith("mode:"));
+  const modeRaw = modeLine ? parseFrontmatterValue(modeLine.replace("mode:", "")).toLowerCase() : "";
+  const mode: "poll" | "launch" = modeRaw === "launch" ? "launch" : "poll";
 
   const recurringLine = lines.find((l) => l.startsWith("recurring:"));
   const dailyLine = lines.find((l) => l.startsWith("daily:")); // legacy alias
@@ -51,7 +60,28 @@ function parseJobFile(name: string, content: string): Job | null {
     : notifyRaw === "error" ? "error"
     : true;
 
-  return { name, schedule, prompt, recurring, notify };
+  const targetChannelLine = lines.find((l) => l.startsWith("targetChannel:"));
+  const targetTypeLine = lines.find((l) => l.startsWith("targetType:"));
+  const targetIdLine = lines.find((l) => l.startsWith("targetId:"));
+  const createdFromLine = lines.find((l) => l.startsWith("createdFrom:"));
+
+  const targetChannel = targetChannelLine
+    ? parseFrontmatterValue(targetChannelLine.replace("targetChannel:", "")) === "qq" ? "qq" : undefined
+    : undefined;
+  const targetType = targetTypeLine
+    ? (() => {
+        const value = parseFrontmatterValue(targetTypeLine.replace("targetType:", ""));
+        return value === "private" || value === "group" ? value : undefined;
+      })()
+    : undefined;
+  const targetId = targetIdLine
+    ? parseFrontmatterValue(targetIdLine.replace("targetId:", ""))
+    : undefined;
+  const createdFrom = createdFromLine
+    ? parseFrontmatterValue(createdFromLine.replace("createdFrom:", "")) === "qq" ? "qq" : undefined
+    : undefined;
+
+  return { name, mode, schedule, prompt, recurring, notify, targetChannel, targetType, targetId, createdFrom };
 }
 
 export async function loadJobs(): Promise<Job[]> {
@@ -70,6 +100,29 @@ export async function loadJobs(): Promise<Job[]> {
     if (job) jobs.push(job);
   }
   return jobs;
+}
+
+export async function loadJobByName(jobName: string): Promise<Job | null> {
+  const path = join(JOBS_DIR, `${jobName}.md`);
+  const file = Bun.file(path);
+  if (!(await file.exists())) return null;
+  return parseJobFile(jobName, await file.text());
+}
+
+export async function writeJobFile(job: Job): Promise<void> {
+  await mkdir(JOBS_DIR, { recursive: true });
+  const lines = [
+    `mode: "${job.mode}"`,
+    `schedule: "${job.schedule}"`,
+    `recurring: ${job.recurring ? "true" : "false"}`,
+    `notify: ${job.notify === true ? "true" : job.notify === false ? "false" : "error"}`,
+  ];
+  if (job.targetChannel) lines.push(`targetChannel: "${job.targetChannel}"`);
+  if (job.targetType) lines.push(`targetType: "${job.targetType}"`);
+  if (job.targetId) lines.push(`targetId: "${job.targetId}"`);
+  if (job.createdFrom) lines.push(`createdFrom: "${job.createdFrom}"`);
+  const content = `---\n${lines.join("\n")}\n---\n${job.prompt.trim()}\n`;
+  await Bun.write(join(JOBS_DIR, `${job.name}.md`), content);
 }
 
 export async function clearJobSchedule(jobName: string): Promise<void> {

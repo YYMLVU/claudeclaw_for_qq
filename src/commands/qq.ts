@@ -20,6 +20,7 @@ import { mkdir, readFile, writeFile, stat } from "fs/promises";
 import { homedir } from "os";
 import { streamUserMessage, parseTaskOverride } from "../runner";
 import { getSettings, loadSettings } from "../config";
+import { createLaunchJob } from "../job-service";
 
 // --- QQ Official API constants ---
 
@@ -502,6 +503,53 @@ function cleanContent(content: string): string {
   return content.replace(/<face[^>]*>.*?<\/face>/g, "").trim();
 }
 
+interface LaunchJobDeclaration {
+  name: string;
+  schedule: string;
+  recurring: boolean;
+  prompt: string;
+}
+
+function parseLaunchJobDeclaration(text: string): LaunchJobDeclaration | null {
+  const match = text.match(/<qq-launch-job>\s*([\s\S]*?)<\/qq-launch-job>/i);
+  if (!match) return null;
+  const body = match[1].trim();
+  const promptMatch = body.match(/(?:^|\n)prompt:\s*\n([\s\S]*)$/i);
+  const nameMatch = body.match(/(?:^|\n)name:\s*(.+)$/im);
+  const scheduleMatch = body.match(/(?:^|\n)schedule:\s*(.+)$/im);
+  const recurringMatch = body.match(/(?:^|\n)recurring:\s*(.+)$/im);
+  if (!nameMatch || !scheduleMatch || !promptMatch) return null;
+  const recurringRaw = recurringMatch?.[1]?.trim().toLowerCase() ?? "true";
+  return {
+    name: nameMatch[1].trim(),
+    schedule: scheduleMatch[1].trim(),
+    recurring: recurringRaw === "true" || recurringRaw === "yes" || recurringRaw === "1",
+    prompt: promptMatch[1].trim(),
+  };
+}
+
+function stripLaunchJobBlock(text: string): string {
+  return text.replace(/\n*<qq-launch-job>[\s\S]*?<\/qq-launch-job>\s*/gi, "").trim();
+}
+
+async function maybeCreateLaunchJobFromClaudeOutput(
+  text: string,
+  target: { targetType: "private" | "group"; targetId: string }
+): Promise<string | null> {
+  const declaration = parseLaunchJobDeclaration(text);
+  if (!declaration) return null;
+  const job = await createLaunchJob({
+    name: declaration.name,
+    schedule: declaration.schedule,
+    prompt: declaration.prompt,
+    recurring: declaration.recurring,
+    notify: true,
+    targetType: target.targetType,
+    targetId: target.targetId,
+  });
+  return `已创建启动型定时任务：${job.name}\nSchedule: ${job.schedule}\nTarget: ${target.targetType}`;
+}
+
 function buildPrompt(label: string, content: string, imageUrl?: string, filePaths?: string[]): string {
   const parts = [`[QQ from ${label}]`];
   if (content.trim()) parts.push(`Message: ${content}`);
@@ -515,6 +563,13 @@ function buildPrompt(label: string, content: string, imageUrl?: string, filePath
   parts.push("Inside that block, put one absolute file path per line.");
   parts.push("Only list files that already exist under ~/.");
   parts.push("Do not mention a file-send block unless QQ should actually send those files.");
+  parts.push("If the user is asking you to create a launch-type scheduled job that should only start at schedule time, decide that yourself from intent rather than keywords.");
+  parts.push("When you decide to create such a QQ launch job, append a <qq-launch-job> block at the end of your final response.");
+  parts.push("Inside that block use exactly these fields: name, schedule, recurring, prompt.");
+  parts.push("Use a valid 5-field cron expression for schedule.");
+  parts.push("Set prompt to the exact task text that should run at schedule time.");
+  parts.push("Outside the block, speak naturally to the user and confirm what will happen.");
+  parts.push("Do not emit a <qq-launch-job> block unless you want the system to actually create the job now.");
 
   if (imageUrl) {
     parts.push(`Image URL: ${imageUrl}`);
@@ -621,25 +676,30 @@ async function handleC2CMessage(msg: C2CMessage): Promise<void> {
 
     // If placeholder was set, do final edit. Otherwise send the full text.
     const fullText = accumulated.trim();
-    const displayText = stripDeclaredSendFilesBlock(fullText);
+    const launchJobNotice = await maybeCreateLaunchJobFromClaudeOutput(fullText, {
+      targetType: "private",
+      targetId: msg.author.union_openid,
+    }).catch((err) => `启动型定时任务创建失败: ${err instanceof Error ? err.message : String(err)}`);
+    const displayText = stripLaunchJobBlock(stripDeclaredSendFilesBlock(fullText));
+    const finalDisplayText = [displayText, launchJobNotice].filter(Boolean).join("\n\n");
     if (exitCode !== 0) {
       if (placeholderId) {
         try { await editMessage("user", msg.author.user_openid, placeholderId, `Error (exit ${exitCode}): Claude session error`); } catch {}
       } else {
         await sendC2CMessage(msg.author.user_openid, `Error (exit ${exitCode}): Claude session error`);
       }
-    } else if (displayText) {
+    } else if (finalDisplayText) {
       if (placeholderId) {
-        try { await editMessage("user", msg.author.user_openid, placeholderId, displayText.slice(0, 2000)); } catch {}
-        if (displayText.length > 2000) {
-          const remaining = displayText.slice(2000);
+        try { await editMessage("user", msg.author.user_openid, placeholderId, finalDisplayText.slice(0, 2000)); } catch {}
+        if (finalDisplayText.length > 2000) {
+          const remaining = finalDisplayText.slice(2000);
           const chunks = splitMessage(remaining, 2000);
           for (const chunk of chunks) {
             await sendC2CMessage(msg.author.user_openid, chunk);
           }
         }
       } else {
-        const chunks = splitMessage(displayText, 2000);
+        const chunks = splitMessage(finalDisplayText, 2000);
         for (const chunk of chunks) {
           await sendC2CMessage(msg.author.user_openid, chunk);
         }
@@ -790,25 +850,30 @@ async function handleGroupMessage(msg: GroupMessage): Promise<void> {
     if (editDebounce) { clearTimeout(editDebounce); editDebounce = null; }
 
     const fullText = accumulated.trim();
-    const displayText = stripDeclaredSendFilesBlock(fullText);
+    const launchJobNotice = await maybeCreateLaunchJobFromClaudeOutput(fullText, {
+      targetType: "group",
+      targetId: msg.group_openid,
+    }).catch((err) => `启动型定时任务创建失败: ${err instanceof Error ? err.message : String(err)}`);
+    const displayText = stripLaunchJobBlock(stripDeclaredSendFilesBlock(fullText));
+    const finalDisplayText = [displayText, launchJobNotice].filter(Boolean).join("\n\n");
     if (exitCode !== 0) {
       if (placeholderId) {
         try { await editMessage("group", msg.group_openid, placeholderId, `Error (exit ${exitCode}): Claude session error`); } catch {}
       } else {
         await sendGroupMessage(msg.group_openid, `Error (exit ${exitCode}): Claude session error`);
       }
-    } else if (displayText) {
+    } else if (finalDisplayText) {
       if (placeholderId) {
-        try { await editMessage("group", msg.group_openid, placeholderId, displayText.slice(0, 2000)); } catch {}
-        if (displayText.length > 2000) {
-          const remaining = displayText.slice(2000);
+        try { await editMessage("group", msg.group_openid, placeholderId, finalDisplayText.slice(0, 2000)); } catch {}
+        if (finalDisplayText.length > 2000) {
+          const remaining = finalDisplayText.slice(2000);
           const chunks = splitMessage(remaining, 2000);
           for (const chunk of chunks) {
             await sendGroupMessage(msg.group_openid, chunk);
           }
         }
       } else {
-        const chunks = splitMessage(displayText, 2000);
+        const chunks = splitMessage(finalDisplayText, 2000);
         for (const chunk of chunks) {
           await sendGroupMessage(msg.group_openid, chunk);
         }
@@ -1254,6 +1319,27 @@ async function connectGateway(): Promise<void> {
 // --- Public API ---
 
 export { buildPrompt, extractDeclaredSendFiles, formatSendFileHint, isAllowedSendFilePath, stripDeclaredSendFilesBlock };
+
+export function formatJobResultMessage(
+  jobName: string,
+  result: { ok: boolean; text: string }
+): string {
+  return result.ok
+    ? `[定时任务: ${jobName}]\n\n${result.text}`
+    : `[定时任务失败: ${jobName}]\n\n${result.text}`;
+}
+
+export async function sendJobTextToQQ(target: {
+  targetType: "private" | "group";
+  targetId: string;
+  text: string;
+}): Promise<void> {
+  if (target.targetType === "private") {
+    await sendC2CMessage(target.targetId, target.text);
+    return;
+  }
+  await sendGroupMessage(target.targetId, target.text);
+}
 
 /** Send a message to a QQ user (C2C) by union_openid. */
 export async function sendMessageToUser(token: string, openid: string, text: string): Promise<void> {

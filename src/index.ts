@@ -6,6 +6,7 @@ import { telegram } from "./commands/telegram";
 import { discord } from "./commands/discord";
 import { qq } from "./commands/qq";
 import { send } from "./commands/send";
+import { runLaunchJobCommand } from "./job-runner";
 
 const args = process.argv.slice(2);
 const command = args[0];
@@ -28,6 +29,8 @@ if (command === "--stop-all") {
   qq();
 } else if (command === "send") {
   send(args.slice(1));
+} else if (command === "run-job") {
+  process.exit(await runLaunchJobCommand(args.slice(1)));
 } else {
   start();
 }
