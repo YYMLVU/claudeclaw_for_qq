@@ -4,6 +4,13 @@ import { homedir } from "os";
 import { existsSync } from "fs";
 import { getSession, createSession, incrementTurn, markCompactWarned, resetSession } from "./sessions";
 import {
+  getTaskSession,
+  createTaskSession,
+  incrementTaskSessionTurn,
+  markTaskSessionCompactWarned,
+  removeTaskSession,
+} from "./taskSessions";
+import {
   getThreadSession,
   createThreadSession,
   incrementThreadTurn,
@@ -58,9 +65,64 @@ export interface RunResult {
   exitCode: number;
 }
 
+export type SessionScope =
+  | { kind: "global" }
+  | {
+      kind: "task";
+      taskSessionKey: string;
+      channel: "qq";
+      targetType: "private" | "group" | "channel";
+      targetId: string;
+      model: string;
+    };
+
 const RATE_LIMIT_PATTERN = /you.ve hit your limit|out of extra usage/i;
 
 const TASK_MODELS = new Set(["opus", "sonnet", "haiku"]);
+
+async function getScopedSession(scope?: SessionScope) {
+  if (!scope || scope.kind === "global") return await getSession();
+  return await getTaskSession(scope.taskSessionKey);
+}
+
+async function createScopedSession(scope: SessionScope | undefined, sessionId: string): Promise<void> {
+  if (!scope || scope.kind === "global") {
+    await createSession(sessionId);
+    return;
+  }
+
+  await createTaskSession({
+    taskSessionKey: scope.taskSessionKey,
+    sessionId,
+    channel: scope.channel,
+    targetType: scope.targetType,
+    targetId: scope.targetId,
+    model: scope.model,
+  });
+}
+
+async function incrementScopedTurn(scope?: SessionScope): Promise<number> {
+  if (!scope || scope.kind === "global") return await incrementTurn();
+  return await incrementTaskSessionTurn(scope.taskSessionKey);
+}
+
+async function markScopedCompactWarned(scope?: SessionScope): Promise<void> {
+  if (!scope || scope.kind === "global") {
+    await markCompactWarned();
+    return;
+  }
+
+  await markTaskSessionCompactWarned(scope.taskSessionKey);
+}
+
+async function resetScopedSession(scope?: SessionScope): Promise<void> {
+  if (!scope || scope.kind === "global") {
+    await resetSession();
+    return;
+  }
+
+  await removeTaskSession(scope.taskSessionKey);
+}
 
 /**
  * Parse `/task <model>` prefix from a prompt.
@@ -212,12 +274,14 @@ function resolveTaskWorkDir(taskCwd?: string): string {
   return trimmed === home || trimmed.startsWith(`${home}/`) ? trimmed : home;
 }
 
-const DIR_SCOPE_PROMPT = [
-  `CRITICAL SECURITY CONSTRAINT: You are scoped to the working directory: ${resolveTaskWorkDir(PROJECT_DIR)}`,
-  "You MUST NOT read, write, edit, or delete any file outside this directory.",
-  "You MUST NOT run bash commands that modify anything outside this directory (no cd /, no /etc, no ../.. escapes).",
-  "If a request requires accessing files outside the working directory, refuse and explain why.",
-].join("\n");
+function buildDirScopePrompt(taskCwd?: string): string {
+  return [
+    `CRITICAL SECURITY CONSTRAINT: You are scoped to the working directory: ${resolveTaskWorkDir(taskCwd ?? PROJECT_DIR)}`,
+    "You MUST NOT read, write, edit, or delete any file outside this directory.",
+    "You MUST NOT run bash commands that modify anything outside this directory (no cd /, no /etc, no ../.. escapes).",
+    "If a request requires accessing files outside the working directory, refuse and explain why.",
+  ].join("\n");
+}
 
 export async function ensureProjectClaudeMd(): Promise<void> {
   // Preflight-only initialization: never rewrite an existing project CLAUDE.md.
@@ -416,12 +480,12 @@ export async function compactCurrentSession(): Promise<{ success: boolean; messa
     : { success: false, message: `❌ Compact failed (${existing.sessionId.slice(0, 8)})` };
 }
 
-async function execClaude(name: string, prompt: string, threadId?: string, taskCwd?: string): Promise<RunResult> {
+async function execClaude(name: string, prompt: string, threadId?: string, taskCwd?: string, sessionScope?: SessionScope): Promise<RunResult> {
   await mkdir(LOGS_DIR, { recursive: true });
 
   const existing = threadId
     ? await getThreadSession(threadId)
-    : await getSession();
+    : await getScopedSession(sessionScope);
   const isNew = !existing;
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
   const logFile = join(LOGS_DIR, `${name}-${timestamp}.log`);
@@ -429,23 +493,28 @@ async function execClaude(name: string, prompt: string, threadId?: string, taskC
   // Parse /task <model> override — strips the prefix from prompt
   const { model: taskModel, cleanPrompt } = parseTaskOverride(prompt);
   const effectivePrompt = taskModel ? cleanPrompt : prompt;
+  const scopedModel = sessionScope?.kind === "task" ? sessionScope.model : undefined;
 
   const settings = getSettings();
   const { security, model, api, fallback, agentic } = settings;
+
+  const effectiveTaskModel = taskModel ?? scopedModel ?? null;
 
   // Determine which model to use based on agentic routing
   let primaryConfig: ModelConfig;
   let taskType = "unknown";
   let routingReasoning = "";
 
-  if (taskModel) {
-    // /task override takes highest priority
-    primaryConfig = { model: taskModel, api };
-    taskType = "task-override";
-    routingReasoning = `/task ${taskModel} override`;
-    console.log(
-      `[${new Date().toLocaleTimeString()}] Task model override: ${taskModel} (prompt stripped /task prefix)`
-    );
+  if (effectiveTaskModel) {
+    // /task override takes highest priority; task scope provides the fallback model binding
+    primaryConfig = { model: effectiveTaskModel, api };
+    taskType = taskModel ? "task-override" : "task-scope";
+    routingReasoning = taskModel ? `/task ${taskModel} override` : `task scope ${effectiveTaskModel}`;
+    if (taskModel) {
+      console.log(
+        `[${new Date().toLocaleTimeString()}] Task model override: ${taskModel} (prompt stripped /task prefix)`
+      );
+    }
   } else if (agentic.enabled) {
     const routing = selectModel(effectivePrompt, agentic.modes, agentic.defaultMode);
     primaryConfig = { model: routing.model, api };
@@ -497,7 +566,7 @@ async function execClaude(name: string, prompt: string, threadId?: string, taskC
     }
   }
 
-  if (security.level !== "unrestricted") appendParts.push(DIR_SCOPE_PROMPT);
+  if (security.level !== "unrestricted") appendParts.push(buildDirScopePrompt(taskCwd));
   if (appendParts.length > 0) {
     args.push("--append-system-prompt", appendParts.join("\n\n"));
   }
@@ -514,7 +583,7 @@ async function execClaude(name: string, prompt: string, threadId?: string, taskC
     console.warn(
       `[${new Date().toLocaleTimeString()}] Stored Claude session ${existing.sessionId.slice(0, 8)} is invalid; resetting local session and retrying as new session...`
     );
-    await resetSession();
+    await resetScopedSession(sessionScope);
 
     const retryArgs = ["claude", "-p", effectivePrompt, "--output-format", "json", ...securityArgs];
     if (appendParts.length > 0) {
@@ -557,7 +626,7 @@ async function execClaude(name: string, prompt: string, threadId?: string, taskC
         await createThreadSession(threadId, sessionId);
         console.log(`[${new Date().toLocaleTimeString()}] Thread session created: ${sessionId} (thread ${threadId.slice(0, 8)})`);
       } else {
-        await createSession(sessionId);
+        await createScopedSession(sessionScope, sessionId);
         console.log(`[${new Date().toLocaleTimeString()}] Session created: ${sessionId}`);
       }
     } catch (e) {
@@ -619,7 +688,7 @@ async function execClaude(name: string, prompt: string, threadId?: string, taskC
       });
 
       if (retryExec.exitCode === 0) {
-        const count = threadId ? await incrementThreadTurn(threadId) : await incrementTurn();
+        const count = threadId ? await incrementThreadTurn(threadId) : await incrementScopedTurn(sessionScope);
         console.log(`[${new Date().toLocaleTimeString()}] Turn count: ${count} (after compact + retry)`);
       }
       return retryResult;
@@ -628,14 +697,14 @@ async function execClaude(name: string, prompt: string, threadId?: string, taskC
 
   // --- Turn tracking & compact warning ---
   if (exitCode === 0 && !isNew) {
-    const turnCount = threadId ? await incrementThreadTurn(threadId) : await incrementTurn();
+    const turnCount = threadId ? await incrementThreadTurn(threadId) : await incrementScopedTurn(sessionScope);
     console.log(`[${new Date().toLocaleTimeString()}] Turn count: ${turnCount}${threadId ? ` (thread ${threadId.slice(0, 8)})` : ""}`);
 
     if (turnCount >= COMPACT_WARN_THRESHOLD && existing && !existing.compactWarned) {
       if (threadId) {
         await markThreadCompactWarned(threadId);
       } else {
-        await markCompactWarned();
+        await markScopedCompactWarned(sessionScope);
       }
       emitCompactEvent({ type: "warn", turnCount });
     }
@@ -646,8 +715,8 @@ async function execClaude(name: string, prompt: string, threadId?: string, taskC
 
 export { resolveTaskWorkDir };
 
-export async function run(name: string, prompt: string, threadId?: string, taskCwd?: string): Promise<RunResult> {
-  return enqueue(() => execClaude(name, prompt, threadId, taskCwd), threadId);
+export async function run(name: string, prompt: string, threadId?: string, taskCwd?: string, sessionScope?: SessionScope): Promise<RunResult> {
+  return enqueue(() => execClaude(name, prompt, threadId, taskCwd, sessionScope), threadId);
 }
 
 async function streamClaude(
@@ -659,17 +728,19 @@ async function streamClaude(
   idleTimeoutMs?: number,
   overrideModel?: string,
   taskCwd?: string,
+  sessionScope?: SessionScope,
 ): Promise<number> {
   await mkdir(LOGS_DIR, { recursive: true });
 
   // Parse /task <model> override — strips the prefix from prompt
   const { model: taskModel, cleanPrompt } = parseTaskOverride(prompt);
   const effectivePrompt = taskModel ? cleanPrompt : prompt;
-  const effectiveModel = taskModel || overrideModel;
+  const scopedModel = sessionScope?.kind === "task" ? sessionScope.model : undefined;
+  const effectiveModel = taskModel || overrideModel || scopedModel;
 
   const existing = threadId
     ? await getThreadSession(threadId)
-    : await getSession();
+    : await getScopedSession(sessionScope);
   const { security, model, api } = getSettings();
   const securityArgs = buildSecurityArgs(security);
 
@@ -684,8 +755,8 @@ async function streamClaude(
   // --verbose is required for stream-json to produce output in -p (print) mode.
   const args = ["claude", "-p", effectivePrompt, "--output-format", "stream-json", "--verbose", ...securityArgs];
 
-  // Only resume existing session when NOT overriding model — --resume locks the session's original model
-  if (existing && !effectiveModel) args.push("--resume", existing.sessionId);
+  const shouldResume = existing && (!effectiveModel || sessionScope?.kind === "task");
+  if (shouldResume) args.push("--resume", existing.sessionId);
 
   const promptContent = await loadPrompts();
   const appendParts: string[] = ["You are running inside ClaudeClaw."];
@@ -698,7 +769,7 @@ async function streamClaude(
     } catch {}
   }
 
-  if (security.level !== "unrestricted") appendParts.push(DIR_SCOPE_PROMPT);
+  if (security.level !== "unrestricted") appendParts.push(buildDirScopePrompt(taskCwd));
   if (appendParts.length > 0) {
     args.push("--append-system-prompt", appendParts.join("\n\n"));
   }
@@ -721,9 +792,61 @@ async function streamClaude(
   const reader = proc.stdout.getReader();
   const decoder = new TextDecoder();
   let buf = "";
+  let stderrText = "";
+  let currentSessionId = existing?.sessionId;
+  let createdSession = false;
+  let retriedAfterInvalidSession = false;
   let unblocked = false;
   let textEmitted = false;
   let killed = false;
+
+  const readStderr = (async () => {
+    try {
+      stderrText = await new Response(proc.stderr).text();
+    } catch {
+      stderrText = "";
+    }
+  })();
+
+  const rerunWithoutResume = async (): Promise<number> => {
+    await resetScopedSession(sessionScope);
+    const retryArgs = ["claude", "-p", effectivePrompt, "--output-format", "stream-json", "--verbose", ...securityArgs];
+    if (appendParts.length > 0) {
+      retryArgs.push("--append-system-prompt", appendParts.join("\n\n"));
+    }
+    const normalizedRetryModel = (effectiveModel || model).trim().toLowerCase();
+    if ((effectiveModel || model).trim() && normalizedRetryModel !== "glm") {
+      retryArgs.push("--model", (effectiveModel || model).trim());
+    }
+    retriedAfterInvalidSession = true;
+    const retryExitCode = await streamClaude(name, prompt, onChunk, onUnblock, threadId, idleTimeoutMs, overrideModel, taskCwd, sessionScope);
+    return retryExitCode;
+  };
+
+  const recordSuccessfulStreamTurn = async () => {
+    if (threadId) {
+      const turnCount = await incrementThreadTurn(threadId);
+      console.log(`[${new Date().toLocaleTimeString()}] Turn count: ${turnCount} (thread ${threadId.slice(0, 8)})`);
+      return;
+    }
+
+    if (!existing && !createdSession && !retriedAfterInvalidSession) return;
+
+    const turnCount = await incrementScopedTurn(sessionScope);
+    console.log(`[${new Date().toLocaleTimeString()}] Turn count: ${turnCount}`);
+
+    const activeSession = sessionScope ? await getScopedSession(sessionScope) : await getSession();
+    if (turnCount >= COMPACT_WARN_THRESHOLD && activeSession && !activeSession.compactWarned) {
+      if (threadId) {
+        await markThreadCompactWarned(threadId);
+      } else {
+        await markScopedCompactWarned(sessionScope);
+      }
+      emitCompactEvent({ type: "warn", turnCount });
+    }
+  };
+
+  let procKilledByInvalidSessionRetry = false;
 
   // Idle timeout: kill process if no stdout activity for idleTimeoutMs.
   // This is the root-cause fix for long-running tasks — as long as Claude
@@ -773,11 +896,13 @@ async function streamClaude(
             // Capture session ID for new sessions
             const sid = event.session_id as string | undefined;
             if (sid && !existing) {
+              currentSessionId = sid;
+              createdSession = true;
               if (threadId) {
                 await createThreadSession(threadId, sid);
                 console.log(`[${new Date().toLocaleTimeString()}] Thread session created (stream-json): ${sid}`);
               } else {
-                await createSession(sid);
+                await createScopedSession(sessionScope, sid);
                 console.log(`[${new Date().toLocaleTimeString()}] Session created (stream-json): ${sid}`);
               }
             }
@@ -817,11 +942,24 @@ async function streamClaude(
 
   if (idleTimer) clearTimeout(idleTimer);
   await proc.exited;
+  await readStderr;
   // Ensure unblock fires even if something unexpected happened
   maybeUnblock();
 
   const exitCode = proc.exitCode ?? (killed ? 124 : 1);
+
+  if (!killed && shouldResume && isMissingResumeSessionError(buf, stderrText)) {
+    procKilledByInvalidSessionRetry = true;
+    console.warn(
+      `[${new Date().toLocaleTimeString()}] Stored Claude session ${currentSessionId?.slice(0, 8) ?? "unknown"} is invalid in stream mode; resetting local session and retrying as new session...`
+    );
+    return await rerunWithoutResume();
+  }
+
   console.log(`[${new Date().toLocaleTimeString()}] Done: ${name} (exit ${exitCode})`);
+  if (exitCode === 0 && !procKilledByInvalidSessionRetry) {
+    await recordSuccessfulStreamTurn();
+  }
   return exitCode;
 }
 
@@ -834,9 +972,10 @@ export async function streamUserMessage(
   idleTimeoutMs?: number,
   overrideModel?: string,
   taskCwd?: string,
+  sessionScope?: SessionScope,
 ): Promise<number> {
   return enqueue(
-    () => streamClaude(name, prefixUserMessageWithClock(prompt), onChunk, onUnblock, threadId, idleTimeoutMs, overrideModel, taskCwd),
+    () => streamClaude(name, prefixUserMessageWithClock(prompt), onChunk, onUnblock, threadId, idleTimeoutMs, overrideModel, taskCwd, sessionScope),
     threadId,
   ) as unknown as Promise<number>;
 }
@@ -852,8 +991,8 @@ function prefixUserMessageWithClock(prompt: string): string {
   }
 }
 
-export async function runUserMessage(name: string, prompt: string, threadId?: string, taskCwd?: string): Promise<RunResult> {
-  return run(name, prefixUserMessageWithClock(prompt), threadId, taskCwd);
+export async function runUserMessage(name: string, prompt: string, threadId?: string, taskCwd?: string, sessionScope?: SessionScope): Promise<RunResult> {
+  return run(name, prefixUserMessageWithClock(prompt), threadId, taskCwd, sessionScope);
 }
 
 /**

@@ -18,7 +18,7 @@ import { join, dirname, basename, resolve } from "path";
 const PROJECT_DIR = "/home/xiao/claudeclaw_for_qq";
 import { mkdir, readFile, writeFile, stat } from "fs/promises";
 import { homedir } from "os";
-import { streamUserMessage, parseTaskOverride } from "../runner";
+import { streamUserMessage, parseTaskOverride, type SessionScope } from "../runner";
 import { getSettings, loadSettings } from "../config";
 import { createLaunchJob } from "../job-service";
 
@@ -76,6 +76,10 @@ interface QQAttachment {
   height?: number;
   url: string;
   width?: number;
+}
+
+interface MsgElement {
+  type?: number;
 }
 
 interface C2CMessage {
@@ -595,6 +599,22 @@ async function maybeCreateLaunchJobFromClaudeOutput(
   return `已创建启动型定时任务：${job.name}\nSchedule: ${job.schedule}\nTarget: ${target.targetType}`;
 }
 
+function buildQqTaskSessionScope(input: {
+  targetType: "private" | "group" | "channel";
+  targetId: string;
+  model: string | null;
+}): SessionScope | undefined {
+  if (!input.model) return undefined;
+  return {
+    kind: "task",
+    taskSessionKey: `qq:${input.targetType}:${input.targetId}:${input.model}`,
+    channel: "qq",
+    targetType: input.targetType,
+    targetId: input.targetId,
+    model: input.model,
+  };
+}
+
 function buildPrompt(label: string, content: string, imageUrl?: string, filePaths?: string[]): string {
   const parts = [`[QQ from ${label}]`];
   if (content.trim()) parts.push(`Message: ${content}`);
@@ -674,6 +694,11 @@ async function handleC2CMessage(msg: C2CMessage): Promise<void> {
   // Parse /task <model> override from raw content before buildPrompt wraps it
   const { model: taskModel, cleanPrompt: taskCleanContent } = parseTaskOverride(content);
   const effectiveContent = taskModel ? taskCleanContent : content;
+  const taskSessionScope = buildQqTaskSessionScope({
+    targetType: "private",
+    targetId: msg.author.user_openid,
+    model: taskModel,
+  });
 
   try {
     await sendTyping(msg.author.user_openid, "user");
@@ -714,7 +739,7 @@ async function handleC2CMessage(msg: C2CMessage): Promise<void> {
 
     const onUnblock = () => {};
 
-    const exitCode = await streamUserMessage("qq", prompt, onChunk, onUnblock, undefined, undefined, taskModel ?? undefined, PROJECT_DIR);
+    const exitCode = await streamUserMessage("qq", prompt, onChunk, onUnblock, undefined, undefined, taskModel ?? undefined, PROJECT_DIR, taskSessionScope);
 
     // Flush any remaining debounced edit
     if (editDebounce) { clearTimeout(editDebounce); editDebounce = null; }
@@ -851,6 +876,11 @@ async function handleGroupMessage(msg: GroupMessage): Promise<void> {
   // Parse /task <model> override from raw content before buildPrompt wraps it
   const { model: groupTaskModel, cleanPrompt: groupCleanContent } = parseTaskOverride(content);
   const groupEffectiveContent = groupTaskModel ? groupCleanContent : content;
+  const groupTaskSessionScope = buildQqTaskSessionScope({
+    targetType: "group",
+    targetId: msg.group_openid,
+    model: groupTaskModel,
+  });
 
   try {
     await sendTyping(msg.group_openid, "group");
@@ -890,7 +920,7 @@ async function handleGroupMessage(msg: GroupMessage): Promise<void> {
     };
 
     const onUnblock = () => {};
-    const exitCode = await streamUserMessage("qq", prompt, onChunk, onUnblock, undefined, undefined, groupTaskModel ?? undefined, PROJECT_DIR);
+    const exitCode = await streamUserMessage("qq", prompt, onChunk, onUnblock, undefined, undefined, groupTaskModel ?? undefined, PROJECT_DIR, groupTaskSessionScope);
 
     if (editDebounce) { clearTimeout(editDebounce); editDebounce = null; }
 
@@ -1024,6 +1054,11 @@ async function handleGuildMessage(msg: GuildMessage): Promise<void> {
   // Parse /task <model> override from raw content before buildPrompt wraps it
   const { model: guildTaskModel, cleanPrompt: guildCleanContent } = parseTaskOverride(content);
   const guildEffectiveContent = guildTaskModel ? guildCleanContent : content;
+  const guildTaskSessionScope = buildQqTaskSessionScope({
+    targetType: "channel",
+    targetId: msg.channel_id,
+    model: guildTaskModel,
+  });
 
   try {
     await sendTyping(msg.channel_id, "channel");
@@ -1063,30 +1098,35 @@ async function handleGuildMessage(msg: GuildMessage): Promise<void> {
     };
 
     const onUnblock = () => {};
-    const exitCode = await streamUserMessage("qq", prompt, onChunk, onUnblock, undefined, undefined, guildTaskModel ?? undefined, PROJECT_DIR);
+    const exitCode = await streamUserMessage("qq", prompt, onChunk, onUnblock, undefined, undefined, guildTaskModel ?? undefined, PROJECT_DIR, guildTaskSessionScope);
 
     if (editDebounce) { clearTimeout(editDebounce); editDebounce = null; }
 
     const fullText = accumulated.trim();
-    const displayText = stripDeclaredSendFilesBlock(fullText);
+    const launchJobNotice = await maybeCreateLaunchJobFromClaudeOutput(
+      fullText,
+      createLaunchJobTargetForMessage(msg)
+    ).catch((err) => `启动型定时任务创建失败: ${err instanceof Error ? err.message : String(err)}`);
+    const displayText = stripLaunchJobBlock(stripDeclaredSendFilesBlock(fullText));
+    const finalDisplayText = [displayText, launchJobNotice].filter(Boolean).join("\n\n");
     if (exitCode !== 0) {
       if (placeholderId) {
         try { await editMessage("channel", msg.channel_id, placeholderId, `Error (exit ${exitCode}): Claude session error`); } catch {}
       } else {
         await sendGuildMessage(msg.channel_id, `Error (exit ${exitCode}): Claude session error`);
       }
-    } else if (displayText) {
+    } else if (finalDisplayText) {
       if (placeholderId) {
-        try { await editMessage("channel", msg.channel_id, placeholderId, displayText.slice(0, 2000)); } catch {}
-        if (displayText.length > 2000) {
-          const remaining = displayText.slice(2000);
+        try { await editMessage("channel", msg.channel_id, placeholderId, finalDisplayText.slice(0, 2000)); } catch {}
+        if (finalDisplayText.length > 2000) {
+          const remaining = finalDisplayText.slice(2000);
           const chunks = splitMessage(remaining, 2000);
           for (const chunk of chunks) {
             await sendGuildMessage(msg.channel_id, chunk);
           }
         }
       } else {
-        const chunks = splitMessage(displayText, 2000);
+        const chunks = splitMessage(finalDisplayText, 2000);
         for (const chunk of chunks) {
           await sendGuildMessage(msg.channel_id, chunk);
         }
@@ -1365,6 +1405,7 @@ async function connectGateway(): Promise<void> {
 
 export {
   buildPrompt,
+  buildQqTaskSessionScope,
   extractDeclaredSendFiles,
   formatSendFileHint,
   isAllowedSendFilePath,
