@@ -514,18 +514,63 @@ function parseLaunchJobDeclaration(text: string): LaunchJobDeclaration | null {
   const match = text.match(/<qq-launch-job>\s*([\s\S]*?)<\/qq-launch-job>/i);
   if (!match) return null;
   const body = match[1].trim();
-  const promptMatch = body.match(/(?:^|\n)prompt:\s*\n([\s\S]*)$/i);
+  const promptBlockMatch = body.match(/(?:^|\n)prompt:\s*\n([\s\S]*)$/i);
+  const promptInlineMatch = body.match(/(?:^|\n)prompt:\s*(.+)$/im);
   const nameMatch = body.match(/(?:^|\n)name:\s*(.+)$/im);
   const scheduleMatch = body.match(/(?:^|\n)schedule:\s*(.+)$/im);
   const recurringMatch = body.match(/(?:^|\n)recurring:\s*(.+)$/im);
-  if (!nameMatch || !scheduleMatch || !promptMatch) return null;
+  const prompt = promptBlockMatch?.[1]?.trim() ?? promptInlineMatch?.[1]?.trim();
+  if (!nameMatch || !scheduleMatch || !prompt) return null;
   const recurringRaw = recurringMatch?.[1]?.trim().toLowerCase() ?? "true";
   return {
     name: nameMatch[1].trim(),
     schedule: scheduleMatch[1].trim(),
     recurring: recurringRaw === "true" || recurringRaw === "yes" || recurringRaw === "1",
-    prompt: promptMatch[1].trim(),
+    prompt,
   };
+}
+
+function resolveLaunchJobTargetId(
+  targetType: "private" | "group",
+  ids: { targetId?: string; user_openid?: string; union_openid?: string }
+): string {
+  if (targetType === "private") {
+    if (!ids.user_openid) {
+      throw new Error("Missing user_openid for private launch job target.");
+    }
+    return ids.user_openid;
+  }
+  return ids.targetId ?? "";
+}
+
+function buildPrivateLaunchJobTarget(msg: C2CMessage): { targetType: "private"; targetId: string } {
+  return {
+    targetType: "private",
+    targetId: resolveLaunchJobTargetId("private", {
+      user_openid: msg.author.user_openid,
+      union_openid: msg.author.union_openid,
+    }),
+  };
+}
+
+function buildGroupLaunchJobTarget(msg: GroupMessage): { targetType: "group"; targetId: string } {
+  return {
+    targetType: "group",
+    targetId: resolveLaunchJobTargetId("group", { targetId: msg.group_openid }),
+  };
+}
+
+function buildGuildLaunchJobTarget(msg: GuildMessage): { targetType: "group"; targetId: string } {
+  return {
+    targetType: "group",
+    targetId: resolveLaunchJobTargetId("group", { targetId: msg.channel_id }),
+  };
+}
+
+function createLaunchJobTargetForMessage(msg: C2CMessage | GroupMessage | GuildMessage): { targetType: "private" | "group"; targetId: string } {
+  if ("group_openid" in msg) return buildGroupLaunchJobTarget(msg);
+  if ("channel_id" in msg) return buildGuildLaunchJobTarget(msg);
+  return buildPrivateLaunchJobTarget(msg);
 }
 
 function stripLaunchJobBlock(text: string): string {
@@ -676,10 +721,10 @@ async function handleC2CMessage(msg: C2CMessage): Promise<void> {
 
     // If placeholder was set, do final edit. Otherwise send the full text.
     const fullText = accumulated.trim();
-    const launchJobNotice = await maybeCreateLaunchJobFromClaudeOutput(fullText, {
-      targetType: "private",
-      targetId: msg.author.union_openid,
-    }).catch((err) => `启动型定时任务创建失败: ${err instanceof Error ? err.message : String(err)}`);
+    const launchJobNotice = await maybeCreateLaunchJobFromClaudeOutput(
+      fullText,
+      createLaunchJobTargetForMessage(msg)
+    ).catch((err) => `启动型定时任务创建失败: ${err instanceof Error ? err.message : String(err)}`);
     const displayText = stripLaunchJobBlock(stripDeclaredSendFilesBlock(fullText));
     const finalDisplayText = [displayText, launchJobNotice].filter(Boolean).join("\n\n");
     if (exitCode !== 0) {
@@ -850,10 +895,10 @@ async function handleGroupMessage(msg: GroupMessage): Promise<void> {
     if (editDebounce) { clearTimeout(editDebounce); editDebounce = null; }
 
     const fullText = accumulated.trim();
-    const launchJobNotice = await maybeCreateLaunchJobFromClaudeOutput(fullText, {
-      targetType: "group",
-      targetId: msg.group_openid,
-    }).catch((err) => `启动型定时任务创建失败: ${err instanceof Error ? err.message : String(err)}`);
+    const launchJobNotice = await maybeCreateLaunchJobFromClaudeOutput(
+      fullText,
+      createLaunchJobTargetForMessage(msg)
+    ).catch((err) => `启动型定时任务创建失败: ${err instanceof Error ? err.message : String(err)}`);
     const displayText = stripLaunchJobBlock(stripDeclaredSendFilesBlock(fullText));
     const finalDisplayText = [displayText, launchJobNotice].filter(Boolean).join("\n\n");
     if (exitCode !== 0) {
@@ -1318,7 +1363,15 @@ async function connectGateway(): Promise<void> {
 
 // --- Public API ---
 
-export { buildPrompt, extractDeclaredSendFiles, formatSendFileHint, isAllowedSendFilePath, stripDeclaredSendFilesBlock };
+export {
+  buildPrompt,
+  extractDeclaredSendFiles,
+  formatSendFileHint,
+  isAllowedSendFilePath,
+  parseLaunchJobDeclaration,
+  resolveLaunchJobTargetId,
+  stripDeclaredSendFilesBlock,
+};
 
 export function formatJobResultMessage(
   jobName: string,
