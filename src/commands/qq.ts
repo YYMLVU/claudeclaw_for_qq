@@ -15,11 +15,12 @@
 
 import { join, dirname, basename, resolve } from "path";
 
-const PROJECT_DIR = "/home/xiao/claudeclaw_for_qq";
+const PROJECT_DIR = homedir();
 import { mkdir, readFile, writeFile, stat } from "fs/promises";
 import { homedir } from "os";
 import { streamUserMessage, parseTaskOverride, type SessionScope } from "../runner";
 import { getSettings, loadSettings } from "../config";
+import { removeTaskSession } from "../taskSessions";
 import { createLaunchJob } from "../job-service";
 
 // --- QQ Official API constants ---
@@ -615,6 +616,37 @@ function buildQqTaskSessionScope(input: {
   };
 }
 
+function formatClaudeSessionError(exitCode: number, stderr: string): string {
+  const detail = stderr
+    .split("\n")
+    .map((line) => line.trim())
+    .find(Boolean);
+  return detail
+    ? `Error (exit ${exitCode}): ${detail}`
+    : `Error (exit ${exitCode}): Claude session error`;
+}
+
+function buildTaskResetReply(input: {
+  targetType: "private" | "group" | "channel";
+  targetId: string;
+  model: string | null;
+}): { reply: string; taskSessionKey: string } | null {
+  const scope = buildQqTaskSessionScope(input);
+  if (!scope || scope.kind !== "task") return null;
+  return {
+    reply: `已重置 /task ${scope.model} 子会话。下次会新开一个干净会话。`,
+    taskSessionKey: scope.taskSessionKey,
+  };
+}
+
+function parseTaskReset(content: string): { model: string | null } | null {
+  const match = content.match(/^\/task\s+reset\s+(\S+)\s*$/i);
+  if (!match) return null;
+  const model = match[1].toLowerCase();
+  if (!["opus", "sonnet", "haiku"].includes(model)) return { model: null };
+  return { model };
+}
+
 type InboundEventState = {
   startedAt: number;
   status: "running" | "done" | "failed";
@@ -721,6 +753,22 @@ async function handleC2CMessage(msg: C2CMessage, inboundKey?: string | null): Pr
   const content = cleanContent(msg.content);
   if (!content && (msg.attachments ?? []).length === 0) return;
 
+  const taskReset = parseTaskReset(content);
+  if (taskReset) {
+    const reset = buildTaskResetReply({
+      targetType: "private",
+      targetId: msg.author.user_openid,
+      model: taskReset.model,
+    });
+    if (!reset) {
+      await sendC2CMessage(msg.author.user_openid, "用法：/task reset <opus|sonnet|haiku>");
+      return;
+    }
+    await removeTaskSession(reset.taskSessionKey);
+    await sendC2CMessage(msg.author.user_openid, reset.reply);
+    return;
+  }
+
   const downloadDir = getDefaultDownloadDir();
 
   // Determine image vs file attachment
@@ -796,7 +844,11 @@ async function handleC2CMessage(msg: C2CMessage, inboundKey?: string | null): Pr
 
     const onUnblock = () => {};
 
-    const exitCode = await streamUserMessage("qq", prompt, onChunk, onUnblock, undefined, undefined, taskModel ?? undefined, PROJECT_DIR, taskSessionScope);
+    let streamError = "";
+    const exitCode = await streamUserMessage("qq", prompt, onChunk, (stderr) => {
+      streamError = typeof stderr === "string" ? stderr : "";
+      onUnblock();
+    }, undefined, undefined, taskModel ?? undefined, PROJECT_DIR, taskSessionScope);
 
     // Flush any remaining debounced edit
     if (editDebounce) { clearTimeout(editDebounce); editDebounce = null; }
@@ -810,10 +862,11 @@ async function handleC2CMessage(msg: C2CMessage, inboundKey?: string | null): Pr
     const displayText = stripLaunchJobBlock(stripDeclaredSendFilesBlock(fullText));
     const finalDisplayText = [displayText, launchJobNotice].filter(Boolean).join("\n\n");
     if (exitCode !== 0) {
+      const errorText = formatClaudeSessionError(exitCode, streamError);
       if (placeholderId) {
-        try { await editMessage("user", msg.author.user_openid, placeholderId, `Error (exit ${exitCode}): Claude session error`); } catch {}
+        try { await editMessage("user", msg.author.user_openid, placeholderId, errorText); } catch {}
       } else {
-        await sendC2CMessage(msg.author.user_openid, `Error (exit ${exitCode}): Claude session error`);
+        await sendC2CMessage(msg.author.user_openid, errorText);
       }
     } else if (finalDisplayText) {
       if (placeholderId) {
@@ -906,6 +959,22 @@ async function handleGroupMessage(msg: GroupMessage, inboundKey?: string | null)
   const content = cleanContent(msg.content);
   if (!content && (msg.attachments ?? []).length === 0) return;
 
+  const taskReset = parseTaskReset(content);
+  if (taskReset) {
+    const reset = buildTaskResetReply({
+      targetType: "group",
+      targetId: msg.group_openid,
+      model: taskReset.model,
+    });
+    if (!reset) {
+      await sendGroupMessage(msg.group_openid, "用法：/task reset <opus|sonnet|haiku>");
+      return;
+    }
+    await removeTaskSession(reset.taskSessionKey);
+    await sendGroupMessage(msg.group_openid, reset.reply);
+    return;
+  }
+
   const downloadDir = getDefaultDownloadDir();
 
   // Determine image vs file attachment
@@ -980,7 +1049,11 @@ async function handleGroupMessage(msg: GroupMessage, inboundKey?: string | null)
     };
 
     const onUnblock = () => {};
-    const exitCode = await streamUserMessage("qq", prompt, onChunk, onUnblock, undefined, undefined, groupTaskModel ?? undefined, PROJECT_DIR, groupTaskSessionScope);
+    let streamError = "";
+    const exitCode = await streamUserMessage("qq", prompt, onChunk, (stderr) => {
+      streamError = typeof stderr === "string" ? stderr : "";
+      onUnblock();
+    }, undefined, undefined, groupTaskModel ?? undefined, PROJECT_DIR, groupTaskSessionScope);
 
     if (editDebounce) { clearTimeout(editDebounce); editDebounce = null; }
 
@@ -992,10 +1065,11 @@ async function handleGroupMessage(msg: GroupMessage, inboundKey?: string | null)
     const displayText = stripLaunchJobBlock(stripDeclaredSendFilesBlock(fullText));
     const finalDisplayText = [displayText, launchJobNotice].filter(Boolean).join("\n\n");
     if (exitCode !== 0) {
+      const errorText = formatClaudeSessionError(exitCode, streamError);
       if (placeholderId) {
-        try { await editMessage("group", msg.group_openid, placeholderId, `Error (exit ${exitCode}): Claude session error`); } catch {}
+        try { await editMessage("group", msg.group_openid, placeholderId, errorText); } catch {}
       } else {
-        await sendGroupMessage(msg.group_openid, `Error (exit ${exitCode}): Claude session error`);
+        await sendGroupMessage(msg.group_openid, errorText);
       }
     } else if (finalDisplayText) {
       if (placeholderId) {
@@ -1087,6 +1161,22 @@ async function handleGuildMessage(msg: GuildMessage, inboundKey?: string | null)
   const content = cleanContent(msg.content);
   if (!content && (msg.attachments ?? []).length === 0) return;
 
+  const taskReset = parseTaskReset(content);
+  if (taskReset) {
+    const reset = buildTaskResetReply({
+      targetType: "channel",
+      targetId: msg.channel_id,
+      model: taskReset.model,
+    });
+    if (!reset) {
+      await sendGuildMessage(msg.channel_id, "用法：/task reset <opus|sonnet|haiku>");
+      return;
+    }
+    await removeTaskSession(reset.taskSessionKey);
+    await sendGuildMessage(msg.channel_id, reset.reply);
+    return;
+  }
+
   const downloadDir = getDefaultDownloadDir();
 
   // Determine image vs file attachment
@@ -1161,7 +1251,11 @@ async function handleGuildMessage(msg: GuildMessage, inboundKey?: string | null)
     };
 
     const onUnblock = () => {};
-    const exitCode = await streamUserMessage("qq", prompt, onChunk, onUnblock, undefined, undefined, guildTaskModel ?? undefined, PROJECT_DIR, guildTaskSessionScope);
+    let streamError = "";
+    const exitCode = await streamUserMessage("qq", prompt, onChunk, (stderr) => {
+      streamError = typeof stderr === "string" ? stderr : "";
+      onUnblock();
+    }, undefined, undefined, guildTaskModel ?? undefined, PROJECT_DIR, guildTaskSessionScope);
 
     if (editDebounce) { clearTimeout(editDebounce); editDebounce = null; }
 
@@ -1173,10 +1267,11 @@ async function handleGuildMessage(msg: GuildMessage, inboundKey?: string | null)
     const displayText = stripLaunchJobBlock(stripDeclaredSendFilesBlock(fullText));
     const finalDisplayText = [displayText, launchJobNotice].filter(Boolean).join("\n\n");
     if (exitCode !== 0) {
+      const errorText = formatClaudeSessionError(exitCode, streamError);
       if (placeholderId) {
-        try { await editMessage("channel", msg.channel_id, placeholderId, `Error (exit ${exitCode}): Claude session error`); } catch {}
+        try { await editMessage("channel", msg.channel_id, placeholderId, errorText); } catch {}
       } else {
-        await sendGuildMessage(msg.channel_id, `Error (exit ${exitCode}): Claude session error`);
+        await sendGuildMessage(msg.channel_id, errorText);
       }
     } else if (finalDisplayText) {
       if (placeholderId) {
@@ -1481,10 +1576,12 @@ async function connectGateway(): Promise<void> {
 export {
   buildPrompt,
   buildQqTaskSessionScope,
+  buildTaskResetReply,
   createInboundEventKey,
   createInboundEventStateStore,
   extractDeclaredSendFiles,
   finalizeInboundEventNow,
+  formatClaudeSessionError,
   formatSendFileHint,
   isAllowedSendFilePath,
   parseLaunchJobDeclaration,

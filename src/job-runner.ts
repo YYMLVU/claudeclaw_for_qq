@@ -1,10 +1,11 @@
 import { sendJobTextToQQ, formatJobResultMessage } from "./commands/qq";
 import { loadSettings } from "./config";
 import { clearJobSchedule, loadJobByName, type Job } from "./jobs";
+import { homedir } from "os";
 import { run, type RunResult } from "./runner";
 import { removeLaunchJob } from "./scheduler/crontab";
 
-const JOB_RUNNER_WORKDIR = "/home/xiao/claudeclaw_for_qq";
+const JOB_RUNNER_WORKDIR = homedir();
 
 async function ensureRunnerSettingsLoaded(): Promise<void> {
   await loadSettings();

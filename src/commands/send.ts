@@ -1,6 +1,7 @@
 import { runUserMessage } from "../runner";
 
-const PROJECT_DIR = "/home/xiao/claudeclaw_for_qq";
+import { homedir } from "node:os";
+const PROJECT_DIR = homedir();
 import { getSession } from "../sessions";
 import { loadSettings, initConfig } from "../config";
 

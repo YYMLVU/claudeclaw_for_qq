@@ -10,7 +10,7 @@ import { resolveSkillPrompt } from "../skills";
 import { mkdir } from "node:fs/promises";
 import { extname, join } from "node:path";
 
-const PROJECT_DIR = "/home/xiao/claudeclaw_for_qq";
+const PROJECT_DIR = homedir();
 
 // --- Discord API constants ---
 

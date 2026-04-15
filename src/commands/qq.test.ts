@@ -1,10 +1,12 @@
 import { describe, expect, it } from "bun:test";
 import {
   buildQqTaskSessionScope,
+  buildTaskResetReply,
   createInboundEventKey,
   createInboundEventStateStore,
   finalizeInboundEventNow,
   formatJobResultMessage,
+  formatClaudeSessionError,
   parseLaunchJobDeclaration,
   resolveLaunchJobTargetId,
   shouldStartInboundEvent,
@@ -97,6 +99,35 @@ it("does not start a second stream while the same inbound event is already runni
   const store = createInboundEventStateStore();
   expect(shouldStartInboundEvent(store, "GROUP_AT_MESSAGE_CREATE:msg-2")).toBe(true);
   expect(shouldStartInboundEvent(store, "GROUP_AT_MESSAGE_CREATE:msg-2")).toBe(false);
+});
+
+describe("QQ task helpers", () => {
+  it("formats Claude session errors with stderr details", () => {
+    expect(formatClaudeSessionError(1, "permission denied\nsecond line")).toBe("Error (exit 1): permission denied");
+  });
+
+  it("falls back when stderr is empty", () => {
+    expect(formatClaudeSessionError(1, "   ")).toBe("Error (exit 1): Claude session error");
+  });
+
+  it("builds a reset reply for an existing task scope", () => {
+    expect(buildTaskResetReply({
+      targetType: "private",
+      targetId: "user-openid-123",
+      model: "haiku",
+    })).toEqual({
+      reply: "已重置 /task haiku 子会话。下次会新开一个干净会话。",
+      taskSessionKey: "qq:private:user-openid-123:haiku",
+    });
+  });
+
+  it("rejects /task reset without a valid model", () => {
+    expect(buildTaskResetReply({
+      targetType: "private",
+      targetId: "user-openid-123",
+      model: null,
+    })).toBeNull();
+  });
 });
 
 describe("buildQqTaskSessionScope", () => {

@@ -1,5 +1,6 @@
 import { writeFile, unlink, mkdir } from "fs/promises";
 import { join } from "path";
+import { homedir } from "os";
 import { fileURLToPath } from "url";
 import { run, runUserMessage, streamUserMessage, bootstrap, ensureProjectClaudeMd, loadHeartbeatPromptTemplate } from "../runner";
 import { writeState, type StateData } from "../statusline";
@@ -16,7 +17,7 @@ const HEARTBEAT_DIR = join(CLAUDE_DIR, "claudeclaw");
 const STATUSLINE_FILE = join(CLAUDE_DIR, "statusline.cjs");
 const CLAUDE_SETTINGS_FILE = join(CLAUDE_DIR, "settings.json");
 const PREFLIGHT_SCRIPT = fileURLToPath(new URL("../preflight.ts", import.meta.url));
-const PROJECT_DIR = "/home/xiao/claudeclaw_for_qq";
+const PROJECT_DIR = homedir();
 
 // --- Statusline setup/teardown ---
 

@@ -265,7 +265,7 @@ async function runClaudeOnce(
   }
 }
 
-const PROJECT_DIR = process.cwd();
+const PROJECT_DIR = homedir();
 
 function resolveTaskWorkDir(taskCwd?: string): string {
   const trimmed = taskCwd?.trim();
