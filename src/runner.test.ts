@@ -1,13 +1,14 @@
-import { beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { homedir } from "os";
 import { join } from "path";
-import { loadSettings } from "./config";
+import { reloadSettings } from "./config";
 import { createSession, getSession, resetSession } from "./sessions";
 import { createTaskSession, getTaskSession, resetTaskSessionsForTests } from "./taskSessions";
 import { resolveTaskWorkDir, runUserMessage, streamUserMessage, type SessionScope } from "./runner";
 
 const originalSpawn = Bun.spawn;
 const settingsFile = join(process.cwd(), ".claude", "claudeclaw", "settings.json");
+let originalSettingsText = "";
 
 function createTextStream(text: string): ReadableStream<Uint8Array> {
   return new ReadableStream({
@@ -65,6 +66,7 @@ describe("task-scoped runner sessions", () => {
   beforeEach(async () => {
     mock.restore();
     Bun.spawn = originalSpawn;
+    originalSettingsText = await Bun.file(settingsFile).text();
     await Bun.write(settingsFile, JSON.stringify({
       model: "sonnet",
       api: "",
@@ -72,9 +74,17 @@ describe("task-scoped runner sessions", () => {
       security: { level: "moderate", allowedTools: [], disallowedTools: [] },
       qq: { appId: "", clientSecret: "", allowedUserIds: [], groupOpenIds: [] },
     }, null, 2) + "\n");
-    await loadSettings();
+    await reloadSettings();
     await resetSession();
     await resetTaskSessionsForTests();
+  });
+
+  afterEach(async () => {
+    Bun.spawn = originalSpawn;
+    if (originalSettingsText) {
+      await Bun.write(settingsFile, originalSettingsText);
+      await reloadSettings();
+    }
   });
 
   test("resumes an existing task session even when the prompt includes a /task model override", async () => {
