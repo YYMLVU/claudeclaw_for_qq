@@ -53,6 +53,41 @@ describe("resolveTaskWorkDir", () => {
   });
 });
 
+test("falls back to home directory for child work when no task cwd is provided", async () => {
+  const originalText = await Bun.file(settingsFile).text();
+  await Bun.write(settingsFile, JSON.stringify({
+    model: "sonnet",
+    api: "",
+    fallback: { model: "", api: "" },
+    security: { level: "moderate", allowedTools: [], disallowedTools: [] },
+    qq: { appId: "", clientSecret: "", allowedUserIds: [], groupOpenIds: [] },
+  }, null, 2) + "\n");
+  await reloadSettings();
+
+  const spawnMock = mock((_args: string[], options?: { cwd?: string }) => {
+    expect(options?.cwd).toBe(homedir());
+    return {
+      stdout: createTextStream(JSON.stringify({ result: "ok" })),
+      stderr: createTextStream(""),
+      exited: Promise.resolve(0),
+      exitCode: 0,
+      kill: () => {},
+    };
+  });
+
+  (Bun as typeof Bun & { spawn: typeof Bun.spawn }).spawn = spawnMock as unknown as typeof Bun.spawn;
+
+  try {
+    const result = await runUserMessage("qq", "hello");
+    expect(result.exitCode).toBe(0);
+    expect(spawnMock).toHaveBeenCalled();
+  } finally {
+    Bun.spawn = originalSpawn;
+    await Bun.write(settingsFile, originalText);
+    await reloadSettings();
+  }
+});
+
 describe("task-scoped runner sessions", () => {
   const taskScope: SessionScope = {
     kind: "task",

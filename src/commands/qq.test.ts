@@ -1,9 +1,14 @@
 import { describe, expect, it } from "bun:test";
 import {
   buildQqTaskSessionScope,
+  createInboundEventKey,
+  createInboundEventStateStore,
+  finalizeInboundEventNow,
   formatJobResultMessage,
   parseLaunchJobDeclaration,
   resolveLaunchJobTargetId,
+  shouldStartInboundEvent,
+  updateInboundEventText,
 } from "./qq";
 
 describe("parseLaunchJobDeclaration", () => {
@@ -59,6 +64,39 @@ describe("QQ job messages", () => {
     expect(formatJobResultMessage("daily-report", { ok: false, text: "exit=1" }))
       .toBe("[定时任务失败: daily-report]\n\nexit=1");
   });
+});
+
+describe("QQ inbound event state", () => {
+  it("builds a stable event key from event name and message id", () => {
+    expect(createInboundEventKey("C2C_MESSAGE_CREATE", { id: "msg-1" })).toBe("C2C_MESSAGE_CREATE:msg-1");
+  });
+
+  it("starts only one in-flight stream for the same event key", () => {
+    const store = createInboundEventStateStore();
+    expect(shouldStartInboundEvent(store, "C2C_MESSAGE_CREATE:msg-1")).toBe(true);
+    expect(shouldStartInboundEvent(store, "C2C_MESSAGE_CREATE:msg-1")).toBe(false);
+  });
+
+  it("tracks accumulated streamed text", () => {
+    const store = createInboundEventStateStore();
+    shouldStartInboundEvent(store, "C2C_MESSAGE_CREATE:msg-1");
+    expect(updateInboundEventText(store, "C2C_MESSAGE_CREATE:msg-1", "同意")).toBe("同意");
+    expect(updateInboundEventText(store, "C2C_MESSAGE_CREATE:msg-1", "同意，开始处理")).toBe("同意，开始处理");
+  });
+
+  it("allows a later delivery after the finished event is cleared", () => {
+    const store = createInboundEventStateStore();
+    expect(shouldStartInboundEvent(store, "C2C_MESSAGE_CREATE:msg-1")).toBe(true);
+    finalizeInboundEventNow(store, "C2C_MESSAGE_CREATE:msg-1", "done");
+    store.delete("C2C_MESSAGE_CREATE:msg-1");
+    expect(shouldStartInboundEvent(store, "C2C_MESSAGE_CREATE:msg-1")).toBe(true);
+  });
+});
+
+it("does not start a second stream while the same inbound event is already running", () => {
+  const store = createInboundEventStateStore();
+  expect(shouldStartInboundEvent(store, "GROUP_AT_MESSAGE_CREATE:msg-2")).toBe(true);
+  expect(shouldStartInboundEvent(store, "GROUP_AT_MESSAGE_CREATE:msg-2")).toBe(false);
 });
 
 describe("buildQqTaskSessionScope", () => {

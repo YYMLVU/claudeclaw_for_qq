@@ -615,6 +615,62 @@ function buildQqTaskSessionScope(input: {
   };
 }
 
+type InboundEventState = {
+  startedAt: number;
+  status: "running" | "done" | "failed";
+  accumulated: string;
+  placeholderId: string | null;
+};
+
+function createInboundEventStateStore() {
+  return new Map<string, InboundEventState>();
+}
+
+function createInboundEventKey(eventName: string, data: unknown): string | null {
+  if (!data || typeof data !== "object") return null;
+  const id = (data as { id?: unknown }).id;
+  return typeof id === "string" && id.trim() ? `${eventName}:${id}` : null;
+}
+
+function shouldStartInboundEvent(store: Map<string, InboundEventState>, key: string): boolean {
+  if (store.has(key)) return false;
+  store.set(key, {
+    startedAt: Date.now(),
+    status: "running",
+    accumulated: "",
+    placeholderId: null,
+  });
+  return true;
+}
+
+function updateInboundEventText(store: Map<string, InboundEventState>, key: string, nextText: string): string {
+  const state = store.get(key);
+  if (!state) return nextText;
+  state.accumulated = nextText;
+  return state.accumulated;
+}
+
+function finalizeInboundEventNow(
+  store: Map<string, InboundEventState>,
+  key: string,
+  status: "done" | "failed",
+) {
+  const state = store.get(key);
+  if (!state) return;
+  state.status = status;
+}
+
+const inboundEventStates = createInboundEventStateStore();
+
+function finalizeInboundEvent(key: string | null, status: "done" | "failed") {
+  if (!key) return;
+  finalizeInboundEventNow(inboundEventStates, key, status);
+  setTimeout(() => {
+    const latest = inboundEventStates.get(key);
+    if (latest && latest.status !== "running") inboundEventStates.delete(key);
+  }, 60_000);
+}
+
 function buildPrompt(label: string, content: string, imageUrl?: string, filePaths?: string[]): string {
   const parts = [`[QQ from ${label}]`];
   if (content.trim()) parts.push(`Message: ${content}`);
@@ -652,7 +708,7 @@ function buildPrompt(label: string, content: string, imageUrl?: string, filePath
   return parts.join("\n");
 }
 
-async function handleC2CMessage(msg: C2CMessage): Promise<void> {
+async function handleC2CMessage(msg: C2CMessage, inboundKey?: string | null): Promise<void> {
   const config = getSettings().qq;
   const userId = msg.author.union_openid;
   const label = getUsername(msg);
@@ -704,12 +760,13 @@ async function handleC2CMessage(msg: C2CMessage): Promise<void> {
     await sendTyping(msg.author.user_openid, "user");
     const prompt = buildPrompt(label, effectiveContent, imageUrl, filePaths.length > 0 ? filePaths : undefined);
 
-    let placeholderId: string | null = null;
-    let accumulated = "";
+    let placeholderId: string | null = inboundKey ? inboundEventStates.get(inboundKey)?.placeholderId ?? null : null;
+    let accumulated = inboundKey ? inboundEventStates.get(inboundKey)?.accumulated ?? "" : "";
     let editDebounce: ReturnType<typeof setTimeout> | null = null;
 
     const onChunk = async (text: string) => {
       accumulated += text;
+      if (inboundKey) updateInboundEventText(inboundEventStates, inboundKey, accumulated);
       if (!placeholderId && accumulated.trim()) {
         try {
           const token = await refreshAccessToken(config.appId, config.clientSecret);
@@ -818,8 +875,10 @@ async function handleC2CMessage(msg: C2CMessage): Promise<void> {
       }
     }
 
+    finalizeInboundEvent(inboundKey ?? null, "done");
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err);
+    finalizeInboundEvent(inboundKey ?? null, "failed");
     console.error(`[QQ] C2C error for ${label}: ${errMsg}`);
     try {
       await sendC2CMessage(msg.author.user_openid, `Error: ${errMsg}`);
@@ -827,7 +886,7 @@ async function handleC2CMessage(msg: C2CMessage): Promise<void> {
   }
 }
 
-async function handleGroupMessage(msg: GroupMessage): Promise<void> {
+async function handleGroupMessage(msg: GroupMessage, inboundKey?: string | null): Promise<void> {
   const config = getSettings().qq;
   const userId = msg.author.member_openid;
   const label = getUsername(msg);
@@ -886,12 +945,13 @@ async function handleGroupMessage(msg: GroupMessage): Promise<void> {
     await sendTyping(msg.group_openid, "group");
     const prompt = buildPrompt(`${label} in ${groupLabel}`, groupEffectiveContent, imageUrl, filePaths.length > 0 ? filePaths : undefined);
 
-    let placeholderId: string | null = null;
-    let accumulated = "";
+    let placeholderId: string | null = inboundKey ? inboundEventStates.get(inboundKey)?.placeholderId ?? null : null;
+    let accumulated = inboundKey ? inboundEventStates.get(inboundKey)?.accumulated ?? "" : "";
     let editDebounce: ReturnType<typeof setTimeout> | null = null;
 
     const onChunk = async (text: string) => {
       accumulated += text;
+      if (inboundKey) updateInboundEventText(inboundEventStates, inboundKey, accumulated);
       if (!placeholderId && accumulated.trim()) {
         try {
           const token = await refreshAccessToken(config.appId, config.clientSecret);
@@ -997,8 +1057,10 @@ async function handleGroupMessage(msg: GroupMessage): Promise<void> {
       }
     }
 
+    finalizeInboundEvent(inboundKey ?? null, "done");
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err);
+    finalizeInboundEvent(inboundKey ?? null, "failed");
     console.error(`[QQ] Group error for ${label}: ${errMsg}`);
     try {
       await sendGroupMessage(msg.group_openid, `Error: ${errMsg}`);
@@ -1006,7 +1068,7 @@ async function handleGroupMessage(msg: GroupMessage): Promise<void> {
   }
 }
 
-async function handleGuildMessage(msg: GuildMessage): Promise<void> {
+async function handleGuildMessage(msg: GuildMessage, inboundKey?: string | null): Promise<void> {
   const config = getSettings().qq;
   const userId = msg.author.union_openid;
   const label = getUsername(msg);
@@ -1064,12 +1126,13 @@ async function handleGuildMessage(msg: GuildMessage): Promise<void> {
     await sendTyping(msg.channel_id, "channel");
     const prompt = buildPrompt(`${label} in guild:${msg.guild_id}`, guildEffectiveContent, imageUrl, filePaths.length > 0 ? filePaths : undefined);
 
-    let placeholderId: string | null = null;
-    let accumulated = "";
+    let placeholderId: string | null = inboundKey ? inboundEventStates.get(inboundKey)?.placeholderId ?? null : null;
+    let accumulated = inboundKey ? inboundEventStates.get(inboundKey)?.accumulated ?? "" : "";
     let editDebounce: ReturnType<typeof setTimeout> | null = null;
 
     const onChunk = async (text: string) => {
       accumulated += text;
+      if (inboundKey) updateInboundEventText(inboundEventStates, inboundKey, accumulated);
       if (!placeholderId && accumulated.trim()) {
         try {
           const token = await refreshAccessToken(config.appId, config.clientSecret);
@@ -1175,8 +1238,10 @@ async function handleGuildMessage(msg: GuildMessage): Promise<void> {
       }
     }
 
+    finalizeInboundEvent(inboundKey ?? null, "done");
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err);
+    finalizeInboundEvent(inboundKey ?? null, "failed");
     console.error(`[QQ] Guild error for ${label}: ${errMsg}`);
     try {
       await sendGuildMessage(msg.channel_id, `Error: ${errMsg}`);
@@ -1243,6 +1308,16 @@ function splitMessage(text: string, maxLen: number): string[] {
 function handleDispatch(eventName: string, data: unknown): void {
   debugLog(`Dispatch: ${eventName}`);
 
+  const inboundKey = createInboundEventKey(eventName, data);
+  if (
+    inboundKey &&
+    (eventName === "C2C_MESSAGE_CREATE" || eventName === "GROUP_AT_MESSAGE_CREATE" || eventName === "AT_MESSAGE_CREATE" || eventName === "DIRECT_MESSAGE_CREATE") &&
+    !shouldStartInboundEvent(inboundEventStates, inboundKey)
+  ) {
+    debugLog(`Skip duplicate in-flight QQ event: ${inboundKey}`);
+    return;
+  }
+
   switch (eventName) {
     case "READY":
       const ready = data as { session_id: string; user: { id: string } };
@@ -1256,25 +1331,25 @@ function handleDispatch(eventName: string, data: unknown): void {
       break;
 
     case "C2C_MESSAGE_CREATE":
-      handleC2CMessage(data as C2CMessage).catch((err) =>
+      handleC2CMessage(data as C2CMessage, inboundKey).catch((err) =>
         console.error("[QQ] C2C_MESSAGE_CREATE unhandled:", err),
       );
       break;
 
     case "GROUP_AT_MESSAGE_CREATE":
-      handleGroupMessage(data as GroupMessage).catch((err) =>
+      handleGroupMessage(data as GroupMessage, inboundKey).catch((err) =>
         console.error("[QQ] GROUP_AT_MESSAGE_CREATE unhandled:", err),
       );
       break;
 
     case "AT_MESSAGE_CREATE":
-      handleGuildMessage(data as GuildMessage).catch((err) =>
+      handleGuildMessage(data as GuildMessage, inboundKey).catch((err) =>
         console.error("[QQ] AT_MESSAGE_CREATE unhandled:", err),
       );
       break;
 
     case "DIRECT_MESSAGE_CREATE":
-      handleGuildMessage(data as GuildMessage).catch((err) =>
+      handleGuildMessage(data as GuildMessage, inboundKey).catch((err) =>
         console.error("[QQ] DIRECT_MESSAGE_CREATE unhandled:", err),
       );
       break;
@@ -1406,12 +1481,17 @@ async function connectGateway(): Promise<void> {
 export {
   buildPrompt,
   buildQqTaskSessionScope,
+  createInboundEventKey,
+  createInboundEventStateStore,
   extractDeclaredSendFiles,
+  finalizeInboundEventNow,
   formatSendFileHint,
   isAllowedSendFilePath,
   parseLaunchJobDeclaration,
   resolveLaunchJobTargetId,
+  shouldStartInboundEvent,
   stripDeclaredSendFilesBlock,
+  updateInboundEventText,
 };
 
 export function formatJobResultMessage(
