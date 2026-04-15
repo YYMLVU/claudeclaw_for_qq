@@ -732,7 +732,6 @@ async function streamClaude(
 ): Promise<number> {
   await mkdir(LOGS_DIR, { recursive: true });
 
-  // Parse /task <model> override — strips the prefix from prompt
   const { model: taskModel, cleanPrompt } = parseTaskOverride(prompt);
   const effectivePrompt = taskModel ? cleanPrompt : prompt;
   const scopedModel = sessionScope?.kind === "task" ? sessionScope.model : undefined;
@@ -750,11 +749,7 @@ async function streamClaude(
     );
   }
 
-  // stream-json gives us events as they happen — text before tool calls,
-  // so we can unblock the UI as soon as Claude acknowledges, not after sub-agents finish.
-  // --verbose is required for stream-json to produce output in -p (print) mode.
   const args = ["claude", "-p", effectivePrompt, "--output-format", "stream-json", "--verbose", ...securityArgs];
-
   const shouldResume = existing && (!effectiveModel || sessionScope?.kind === "task");
   if (shouldResume) args.push("--resume", existing.sessionId);
 
@@ -798,7 +793,30 @@ async function streamClaude(
   let retriedAfterInvalidSession = false;
   let unblocked = false;
   let textEmitted = false;
+  let lastAssistantText = "";
   let killed = false;
+  let procKilledByInvalidSessionRetry = false;
+
+  const IDLE_TIMEOUT = idleTimeoutMs ?? 120_000;
+  let idleTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const resetIdleTimer = () => {
+    if (idleTimer) clearTimeout(idleTimer);
+    if (IDLE_TIMEOUT <= 0) return;
+    idleTimer = setTimeout(() => {
+      console.error(`[${new Date().toLocaleTimeString()}] Stream idle timeout: no output for ${IDLE_TIMEOUT / 1000}s — killing process`);
+      killed = true;
+      try { proc.kill("SIGTERM"); } catch {}
+      setTimeout(() => { try { proc.kill("SIGKILL"); } catch {} }, 5000);
+    }, IDLE_TIMEOUT);
+  };
+
+  const maybeUnblock = () => {
+    if (!unblocked) {
+      unblocked = true;
+      onUnblock();
+    }
+  };
 
   const readStderr = (async () => {
     try {
@@ -810,17 +828,8 @@ async function streamClaude(
 
   const rerunWithoutResume = async (): Promise<number> => {
     await resetScopedSession(sessionScope);
-    const retryArgs = ["claude", "-p", effectivePrompt, "--output-format", "stream-json", "--verbose", ...securityArgs];
-    if (appendParts.length > 0) {
-      retryArgs.push("--append-system-prompt", appendParts.join("\n\n"));
-    }
-    const normalizedRetryModel = (effectiveModel || model).trim().toLowerCase();
-    if ((effectiveModel || model).trim() && normalizedRetryModel !== "glm") {
-      retryArgs.push("--model", (effectiveModel || model).trim());
-    }
     retriedAfterInvalidSession = true;
-    const retryExitCode = await streamClaude(name, prompt, onChunk, onUnblock, threadId, idleTimeoutMs, overrideModel, taskCwd, sessionScope);
-    return retryExitCode;
+    return await streamClaude(name, prompt, onChunk, onUnblock, threadId, idleTimeoutMs, overrideModel, taskCwd, sessionScope);
   };
 
   const recordSuccessfulStreamTurn = async () => {
@@ -846,95 +855,99 @@ async function streamClaude(
     }
   };
 
-  let procKilledByInvalidSessionRetry = false;
+  const emitAssistantDelta = (nextText: string) => {
+    if (!nextText) return;
+    if (nextText === lastAssistantText) return;
+    if (nextText.startsWith(lastAssistantText)) {
+      const delta = nextText.slice(lastAssistantText.length);
+      lastAssistantText = nextText;
+      if (delta) {
+        onChunk(delta);
+        textEmitted = true;
+      }
+      return;
+    }
+    lastAssistantText = nextText;
+    onChunk(nextText);
+    textEmitted = true;
+  };
 
-  // Idle timeout: kill process if no stdout activity for idleTimeoutMs.
-  // This is the root-cause fix for long-running tasks — as long as Claude
-  // produces output (even slowly), the process keeps running. Only truly
-  // stalled processes get killed.
-  const IDLE_TIMEOUT = idleTimeoutMs ?? 120_000; // default 2 min
-  let idleTimer: ReturnType<typeof setTimeout> | null = null;
+  const maybeEmitResultFallback = (resultText: string | undefined) => {
+    if (!resultText || textEmitted) return;
+    lastAssistantText = resultText;
+    onChunk(resultText);
+    textEmitted = true;
+  };
 
-  const resetIdleTimer = () => {
-    if (idleTimer) clearTimeout(idleTimer);
-    if (IDLE_TIMEOUT <= 0) return; // 0 or negative = no timeout
-    idleTimer = setTimeout(() => {
-      console.error(`[${new Date().toLocaleTimeString()}] Stream idle timeout: no output for ${IDLE_TIMEOUT / 1000}s — killing process`);
-      killed = true;
-      try { proc.kill("SIGTERM"); } catch {}
-      setTimeout(() => { try { proc.kill("SIGKILL"); } catch {} }, 5000);
-    }, IDLE_TIMEOUT);
+  const handleStreamEvent = async (event: Record<string, unknown>) => {
+    if (event.type === "system" && (event.subtype === "init" || event.session_id)) {
+      const sid = event.session_id as string | undefined;
+      if (sid && !existing) {
+        currentSessionId = sid;
+        createdSession = true;
+        if (threadId) {
+          await createThreadSession(threadId, sid);
+          console.log(`[${new Date().toLocaleTimeString()}] Thread session created (stream-json): ${sid}`);
+        } else {
+          await createScopedSession(sessionScope, sid);
+          console.log(`[${new Date().toLocaleTimeString()}] Session created (stream-json): ${sid}`);
+        }
+      }
+      return;
+    }
+
+    if (event.type === "assistant") {
+      type ContentBlock = { type: string; text?: string };
+      const msg = event.message as { content?: ContentBlock[] } | undefined;
+      const blocks = msg?.content ?? [];
+      const assistantText = blocks
+        .filter((block) => block.type === "text" && typeof block.text === "string")
+        .map((block) => block.text as string)
+        .join("");
+      const hasToolUse = blocks.some((block) => block.type === "tool_use");
+      if (assistantText) emitAssistantDelta(assistantText);
+      if (assistantText || hasToolUse) maybeUnblock();
+      return;
+    }
+
+    if (event.type === "tool_use") {
+      maybeUnblock();
+      return;
+    }
+
+    if (event.type === "result") {
+      const resultText = (event as Record<string, unknown>).result as string | undefined;
+      maybeEmitResultFallback(resultText);
+      maybeUnblock();
+    }
+  };
+
+  const parseStreamLine = async (line: string) => {
+    const trimmed = line.trim();
+    if (!trimmed) return;
+    try {
+      const event = JSON.parse(trimmed) as Record<string, unknown>;
+      await handleStreamEvent(event);
+    } catch {}
   };
 
   resetIdleTimer();
-
-  const maybeUnblock = () => {
-    if (!unblocked) {
-      unblocked = true;
-      onUnblock();
-    }
-  };
 
   try {
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
-      resetIdleTimer(); // Reset on every stdout activity
+      resetIdleTimer();
       buf += decoder.decode(value, { stream: true });
-
-      // Parse complete newline-delimited JSON events
       const lines = buf.split("\n");
       buf = lines.pop() ?? "";
-
       for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed) continue;
-        try {
-          const event = JSON.parse(trimmed) as Record<string, unknown>;
-
-          if (event.type === "system" && (event.subtype === "init" || event.session_id)) {
-            // Capture session ID for new sessions
-            const sid = event.session_id as string | undefined;
-            if (sid && !existing) {
-              currentSessionId = sid;
-              createdSession = true;
-              if (threadId) {
-                await createThreadSession(threadId, sid);
-                console.log(`[${new Date().toLocaleTimeString()}] Thread session created (stream-json): ${sid}`);
-              } else {
-                await createScopedSession(sessionScope, sid);
-                console.log(`[${new Date().toLocaleTimeString()}] Session created (stream-json): ${sid}`);
-              }
-            }
-          } else if (event.type === "assistant") {
-            // Text and tool_use blocks from the assistant
-            type ContentBlock = { type: string; text?: string; id?: string; name?: string; input?: Record<string, unknown> };
-            const msg = event.message as { content?: ContentBlock[] } | undefined;
-            const blocks = msg?.content ?? [];
-            let hasActivity = false;
-            for (const block of blocks) {
-              if (block.type === "text" && block.text) {
-                onChunk(block.text);
-                textEmitted = true;
-                hasActivity = true;
-              } else if (block.type === "tool_use") {
-                hasActivity = true;
-              }
-            }
-            if (hasActivity) maybeUnblock();
-          } else if (event.type === "tool_use") {
-            // Top-level tool_use event (some stream-json versions) — unblock the UI
-            maybeUnblock();
-          } else if (event.type === "result") {
-            // Final result event — emit text as fallback if no assistant text was seen
-            const resultText = (event as Record<string, unknown>).result as string | undefined;
-            if (resultText && !textEmitted) {
-              onChunk(resultText);
-            }
-            maybeUnblock();
-          }
-        } catch {}
+        await parseStreamLine(line);
       }
+    }
+    if (buf.trim()) {
+      await parseStreamLine(buf);
+      buf = "";
     }
   } catch {
     // reader.read() may throw if process was killed
@@ -943,12 +956,10 @@ async function streamClaude(
   if (idleTimer) clearTimeout(idleTimer);
   await proc.exited;
   await readStderr;
-  // Ensure unblock fires even if something unexpected happened
   maybeUnblock();
 
   const exitCode = proc.exitCode ?? (killed ? 124 : 1);
-
-  if (!killed && shouldResume && isMissingResumeSessionError(buf, stderrText)) {
+  if (!killed && shouldResume && isMissingResumeSessionError(buf, stderrText) && exitCode === 0) {
     procKilledByInvalidSessionRetry = true;
     console.warn(
       `[${new Date().toLocaleTimeString()}] Stored Claude session ${currentSessionId?.slice(0, 8) ?? "unknown"} is invalid in stream mode; resetting local session and retrying as new session...`

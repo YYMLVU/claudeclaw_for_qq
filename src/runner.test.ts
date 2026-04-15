@@ -358,4 +358,43 @@ describe("task-scoped runner sessions", () => {
       compactWarned: false,
     });
   });
+
+  test("emits only the incremental delta when stream-json repeats assistant snapshots", async () => {
+    installSpawnMock({
+      stdout: [
+        JSON.stringify({
+          type: "assistant",
+          message: { content: [{ type: "text", text: "你好" }] },
+        }),
+        JSON.stringify({
+          type: "assistant",
+          message: { content: [{ type: "text", text: "你好，世界" }] },
+        }),
+        JSON.stringify({
+          type: "assistant",
+          message: { content: [{ type: "text", text: "你好，世界" }] },
+        }),
+        JSON.stringify({ type: "result", result: "你好，世界" }),
+        "",
+      ].join("\n"),
+    });
+
+    const chunks: string[] = [];
+    const onUnblock = mock(() => {});
+
+    const exitCode = await streamUserMessage(
+      "qq",
+      "/task haiku say hello",
+      (text) => { chunks.push(text); },
+      onUnblock,
+      undefined,
+      undefined,
+      undefined,
+      "/home/xiao/claudeclaw_for_qq/.worktrees/qq-task-subsessions",
+      taskScope,
+    );
+
+    expect(exitCode).toBe(0);
+    expect(chunks).toEqual(["你好", "，世界"]);
+  });
 });
