@@ -88,6 +88,61 @@ test("falls back to home directory for child work when no task cwd is provided",
   }
 });
 
+test("uses configured Claude binary path instead of relying on PATH", async () => {
+  const originalText = await Bun.file(settingsFile).text();
+  await Bun.write(settingsFile, JSON.stringify({
+    model: "sonnet",
+    api: "",
+    claudeBinPath: "/tmp/fake-claude",
+    fallback: { model: "", api: "" },
+    security: { level: "moderate", allowedTools: [], disallowedTools: [] },
+    qq: { appId: "", clientSecret: "", allowedUserIds: [], groupOpenIds: [] },
+  }, null, 2) + "\n");
+  await reloadSettings();
+  await resetSession();
+
+  const { calls } = installSpawnMock({
+    stdout: JSON.stringify({ session_id: "configured-binary-session", result: "ok" }),
+  });
+
+  try {
+    const result = await runUserMessage("qq", "hello");
+    expect(result.exitCode).toBe(0);
+    expect(calls[0]?.[0]).toBe("/tmp/fake-claude");
+  } finally {
+    Bun.spawn = originalSpawn;
+    await Bun.write(settingsFile, originalText);
+    await reloadSettings();
+  }
+});
+
+
+test("defaults to a stable claude binary path when settings omit it", async () => {
+  const originalText = await Bun.file(settingsFile).text();
+  await Bun.write(settingsFile, JSON.stringify({
+    model: "sonnet",
+    api: "",
+    fallback: { model: "", api: "" },
+    security: { level: "moderate", allowedTools: [], disallowedTools: [] },
+    qq: { appId: "", clientSecret: "", allowedUserIds: [], groupOpenIds: [] },
+  }, null, 2) + "\n");
+  await reloadSettings();
+  await resetSession();
+
+  const { calls } = installSpawnMock({
+    stdout: JSON.stringify({ session_id: "default-binary-session", result: "ok" }),
+  });
+
+  try {
+    const result = await runUserMessage("qq", "hello");
+    expect(result.exitCode).toBe(0);
+    expect(calls[0]?.[0]).toBe(join(homedir(), ".bun", "bin", "claude"));
+  } finally {
+    Bun.spawn = originalSpawn;
+    await Bun.write(settingsFile, originalText);
+    await reloadSettings();
+  }
+});
 describe("task-scoped runner sessions", () => {
   const taskScope: SessionScope = {
     kind: "task",

@@ -194,6 +194,11 @@ function isNotFoundError(error: unknown): boolean {
   return /enoent|no such file or directory/i.test(message);
 }
 
+function resolveClaudeBinPath(): string {
+  const configured = getSettings().claudeBinPath?.trim();
+  return configured || join(homedir(), ".bun", "bin", "claude");
+}
+
 function buildChildEnv(baseEnv: Record<string, string>, model: string, api: string): Record<string, string> {
   const childEnv: Record<string, string> = { ...baseEnv };
   const normalizedModel = model.trim().toLowerCase();
@@ -440,7 +445,7 @@ export async function runCompact(
   taskCwd?: string,
 ): Promise<boolean> {
   const compactArgs = [
-    "claude", "-p", "/compact",
+    resolveClaudeBinPath(), "-p", "/compact",
     "--output-format", "text",
     "--resume", sessionId,
     ...securityArgs,
@@ -541,7 +546,7 @@ async function execClaude(name: string, prompt: string, threadId?: string, taskC
   // New session: use json output to capture Claude's session_id
   // Resumed session: use text output with --resume
   const outputFormat = isNew ? "json" : "text";
-  const args = ["claude", "-p", effectivePrompt, "--output-format", outputFormat, ...securityArgs];
+  const args = [resolveClaudeBinPath(), "-p", effectivePrompt, "--output-format", outputFormat, ...securityArgs];
 
   if (!isNew) {
     args.push("--resume", existing.sessionId);
@@ -585,7 +590,7 @@ async function execClaude(name: string, prompt: string, threadId?: string, taskC
     );
     await resetScopedSession(sessionScope);
 
-    const retryArgs = ["claude", "-p", effectivePrompt, "--output-format", "json", ...securityArgs];
+    const retryArgs = [resolveClaudeBinPath(), "-p", effectivePrompt, "--output-format", "json", ...securityArgs];
     if (appendParts.length > 0) {
       retryArgs.push("--append-system-prompt", appendParts.join("\n\n"));
     }
@@ -749,7 +754,7 @@ async function streamClaude(
     );
   }
 
-  const args = ["claude", "-p", effectivePrompt, "--output-format", "stream-json", "--verbose", ...securityArgs];
+  const args = [resolveClaudeBinPath(), "-p", effectivePrompt, "--output-format", "stream-json", "--verbose", ...securityArgs];
   const shouldResume = existing && (!effectiveModel || sessionScope?.kind === "task");
   if (shouldResume) args.push("--resume", existing.sessionId);
 
