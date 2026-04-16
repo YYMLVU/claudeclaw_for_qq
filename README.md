@@ -270,6 +270,7 @@ QQ 适配器实现了完整的 QQ 官方机器人网关协议：
 - `/task opus 解释这个复杂的架构` — 仅此请求使用 Opus
 - `/task sonnet 修复代码中的这个 bug` — 仅此请求使用 Sonnet
 - `/task haiku 总结这个` — 用 Haiku 快速总结
+- `/task reset opus | sonnet | haiku` — 会重置对应会话
 
 **优先级**：`/task` 覆盖拥有最高优先级，高于智能路由和全局配置。
 
