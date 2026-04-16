@@ -117,7 +117,7 @@ test("uses configured Claude binary path instead of relying on PATH", async () =
 });
 
 
-test("defaults to a stable claude binary path when settings omit it", async () => {
+test("resolves claude binary via which when settings omit it", async () => {
   const originalText = await Bun.file(settingsFile).text();
   await Bun.write(settingsFile, JSON.stringify({
     model: "sonnet",
@@ -129,16 +129,26 @@ test("defaults to a stable claude binary path when settings omit it", async () =
   await reloadSettings();
   await resetSession();
 
+  const originalSpawnSync = Bun.spawnSync;
+  // Mock spawnSync so `which claude` returns our fake path
+  Bun.spawnSync = ((args: string[]) => {
+    if (args[0] === "which" && args[1] === "claude") {
+      return { stdout: new TextEncoder().encode("/usr/local/bin/claude\n"), exitCode: 0 } as any;
+    }
+    return { stdout: new Uint8Array(0), exitCode: 1 } as any;
+  }) as any;
+
   const { calls } = installSpawnMock({
-    stdout: JSON.stringify({ session_id: "default-binary-session", result: "ok" }),
+    stdout: JSON.stringify({ session_id: "which-resolved-session", result: "ok" }),
   });
 
   try {
     const result = await runUserMessage("qq", "hello");
     expect(result.exitCode).toBe(0);
-    expect(calls[0]?.[0]).toBe(join(homedir(), ".bun", "bin", "claude"));
+    expect(calls[0]?.[0]).toBe("/usr/local/bin/claude");
   } finally {
     Bun.spawn = originalSpawn;
+    Bun.spawnSync = originalSpawnSync;
     await Bun.write(settingsFile, originalText);
     await reloadSettings();
   }

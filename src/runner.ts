@@ -196,7 +196,13 @@ function isNotFoundError(error: unknown): boolean {
 
 function resolveClaudeBinPath(): string {
   const configured = getSettings().claudeBinPath?.trim();
-  return configured || join(homedir(), ".bun", "bin", "claude");
+  if (configured) return configured;
+  try {
+    const result = Bun.spawnSync(["which", "claude"], { stderr: "ignore" });
+    const path = new TextDecoder().decode(result.stdout).trim();
+    if (path) return path;
+  } catch { /* which not available */ }
+  return join(homedir(), ".bun", "bin", "claude");
 }
 
 function buildChildEnv(baseEnv: Record<string, string>, model: string, api: string): Record<string, string> {

@@ -1,7 +1,6 @@
 import { join, isAbsolute } from "path";
 import { mkdir } from "fs/promises";
 import { existsSync } from "fs";
-import { homedir } from "os";
 import { normalizeTimezoneName, resolveTimezoneOffsetMinutes } from "./timezone";
 
 const HEARTBEAT_DIR = join(process.cwd(), ".claude", "claudeclaw");
@@ -12,7 +11,7 @@ const LOGS_DIR = join(HEARTBEAT_DIR, "logs");
 const DEFAULT_SETTINGS: Settings = {
   model: "",
   api: "",
-  claudeBinPath: join(homedir(), ".bun", "bin", "claude"),
+  claudeBinPath: "",
   fallback: {
     model: "",
     api: "",
@@ -243,7 +242,7 @@ function parseSettings(raw: Record<string, any>): Settings {
     api: typeof raw.api === "string" ? raw.api.trim() : "",
     claudeBinPath: typeof raw.claudeBinPath === "string" && raw.claudeBinPath.trim()
       ? raw.claudeBinPath.trim()
-      : DEFAULT_SETTINGS.claudeBinPath,
+      : "",
     fallback: {
       model: typeof raw.fallback?.model === "string" ? raw.fallback.model.trim() : "",
       api: typeof raw.fallback?.api === "string" ? raw.fallback.api.trim() : "",
