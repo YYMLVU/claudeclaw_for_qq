@@ -4,6 +4,7 @@ import { clearJobSchedule, loadJobByName, type Job } from "./jobs";
 import { homedir } from "os";
 import { run, type RunResult } from "./runner";
 import { removeLaunchJob } from "./scheduler/crontab";
+import { resetSession } from "./sessions";
 
 const JOB_RUNNER_WORKDIR = homedir();
 
@@ -11,9 +12,18 @@ async function ensureRunnerSettingsLoaded(): Promise<void> {
   await loadSettings();
 }
 
+const LAUNCH_JOB_AUTONOMY_PREFIX = [
+  "这是一个自动化定时任务，没有任何人可以回答你的问题。",
+  "你必须全程自主完成，不要向用户提问、要求选择或等待反馈，一切决策自行判断最优方案。",
+].join("");
+
 async function execLaunchPrompt(job: Job): Promise<RunResult> {
   await ensureRunnerSettingsLoaded();
-  return run(job.name, job.prompt, undefined, JOB_RUNNER_WORKDIR);
+  // Launch jobs always start fresh — no resume of previous global session,
+  // otherwise recurring jobs accumulate stale context and produce identical output.
+  await resetSession();
+  const prompt = `${LAUNCH_JOB_AUTONOMY_PREFIX}\n\n${job.prompt}`;
+  return run(job.name, prompt, undefined, JOB_RUNNER_WORKDIR);
 }
 
 type LaunchJobExecutor = (job: Job) => Promise<RunResult>;
